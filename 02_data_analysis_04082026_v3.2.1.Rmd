@@ -1,0 +1,1229 @@
+---
+title: "balanced_social_behavior_data_analysis"
+author: "Yama Chang"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+geometry: margin=0.50in
+---
+
+# ============================================================================================= #
+# ============================================================================================= #
+# Tracking Depression Project                                                                   #
+# Balancing Real-Life and Virtual Interactions: How Social Behavior Predicts Depressive Symptoms#
+# Data Analysis                                                                                 #
+# ============================================================================================= #
+# ============================================================================================= #
+
+
+# Project Summary
+This study will use `mlVAR` (multilevel vector autoregressive modeling) to investigate how daily social interaction patterns - specifically, the proportion of in-person vs. online interactions - predict same-day and next-day depressive symptoms in individuals with MDD. Data preprocessing will ensure that variables are free from collinearity, normally distributed, and stationary, with detrending applied as needed. The analysis will examine (1) temporal (lagged) effects to assess how today's social interactions influence next-day PHQ-9 scores, (2) contemporaneous effects to capture same-day relationships, and (3) between-person effects to explore differences across participants in their average interaction patterns and depressive symptoms.
+
+We will analyze daily time-series data collected over 90 days from 300 participants, including passive sensing data on in-person and online social interactions, as well as daily PHQ-9 scores. The primary predictors will be the proportion of in-person social interaction and total social interaction (in-person + virtual).
+
+# Workflow
+0. Correlation Analysis. We will run correlation analysis to examine the association between in-person and online social interaction.
+
+1. Prepare and aggregate data
+  – Convert dates into a proper Date (or numeric) format.
+  – Create two "aggregated" variables from durations (call, app usage, conversation):
+    – **Total Social Interaction**: Sum of in-person and online interactions to gauge overall social engagement.
+    – **Proportion of Real-Life vs. Online Interaction**: A score derived by comparing the total time spent in in-person interactions to the overall time spent on all forms of social engagement.
+
+2. Detrend data
+  – Because `mlVAR` assumes stationarity (i.e. no systematic time trends), we'll need to remove any time-related drift. In this primary analysis, detrending is done at the population level using pooled data across participants, with within-subject detrending retained as a sensitivity analysis.
+
+3. Center the Data Within Person
+  – `mlVAR` benefits from within‐person centering so that the estimated effects reflect deviations from each individual's typical level.
+
+4. Run the `mlVAR` Model
+  – With our detrended (and possibly centered) variables in long format, use the mlVAR package to estimate a lag‑1 (or higher if needed) multilevel VAR.
+  – Specify which variables we want to include (for instance, depressive symptoms and the proportion online). We can also choose whether to let effects vary across persons (random effects) or estimate a fixed-effect network.
+
+5. Plotting and Interpretation
+
+# Research Question
+Confirmatory:
+-	Does reduced in-person social interactions negatively correlate with increased online social interactions? **No, it's not correlated.**
+
+Exploratory:
+-	Does the proportion of in-person social interactions (relative to total social interactions) and the total amount of social interaction (in-person + virtual) predict same-day depressive symptoms? **Yes?**
+-	Does the proportion of in-person social interactions and the total amount of social interaction predict next-day depressive symptoms? **No?**
+
+
+```{r setup, include=FALSE, cache = FALSE}
+require("knitr")
+getwd() # Check where's your working directory
+## setting working directory if not using git
+## setwd("") # Remove hashtag at the beginning and add your working directory inside ""
+knitr::opts_chunk$set(echo = TRUE, tidy = FALSE, warning = FALSE, message = FALSE, include = TRUE, cache = TRUE)
+```
+
+```{r load packages, include=FALSE}
+
+if(!require(car)){install.packages('car')}
+library(car)
+if(!require(psych)){install.packages('psych')}
+library(psych)
+if(!require(effects)){install.packages('effects')}
+library(effects)
+if(!require(tidyverse)){install.packages('tidyverse')}
+library(tidyverse)
+if(!require(summarytools)){install.packages('summarytools')}
+library(summarytools)
+if(!require(diffdf)){install.packages('diffdf')}
+library(diffdf)
+if(!require(janitor)){install.packages('janitor')}
+library(janitor)
+if(!require(haven)){install.packages('haven')}
+library(haven)
+if(!require(lavaan)){install.packages('lavaan')}
+library(lavaan)
+if(!require(readxl)){install.packages('readxl')}
+library(readxl)
+if(!require(lubridate)){install.packages('lubridate')}
+library(lubridate)
+if(!require(mgcv)){install.packages('mgcv')}
+library(mgcv)
+if(!require(mlVAR)){install.packages('mlVAR')}
+library(mlVAR)
+if(!require(here)){install.packages('here')}
+library(here)
+if(!require(tseries)){install.packages('tseries')}
+library(tseries)
+if(!require(purrr)){install.packages('purrr')}
+library(purrr)
+if(!require(gtsummary)){install.packages('gtsummary')}
+library(gtsummary)
+if(!require(flextable)){install.packages('flextable')}
+library(flextable)
+```
+
+# Data Analysis
+
+1. Detrending
+
+2. mlVAR
+
+## Read data
+
+```{r}
+
+# Read pooled imputed data (m=5 imputations stacked with .imp column)
+data_pooled <- read_csv(here::here("data", "df_combined_total_pooled.csv"))
+cat("Loaded", n_distinct(data_pooled$.imp), "imputed datasets\n")
+cat("Participants:", n_distinct(data_pooled$uid), "\n")
+
+# --- Outlier Censoring for Duration Variables ---
+# Cap call and conversation durations at 86,400 seconds (24 hours per day).
+# Values exceeding this threshold are physically impossible and represent
+# sensor errors. App duration is NOT censored (already controlled by 5-min timeout).
+DURATION_CAP_SEC <- 86400  # 24 hours in seconds
+
+# Report outliers BEFORE censoring
+cat("\n=== Duration Outlier Report (All Imputations) ===\n")
+cat(sprintf("  Call:  %d obs (%.2f%%) > 24h, max = %.1f hours\n",
+    sum(data_pooled$total_call_duration > DURATION_CAP_SEC),
+    100 * mean(data_pooled$total_call_duration > DURATION_CAP_SEC),
+    max(data_pooled$total_call_duration) / 3600))
+cat(sprintf("  Convo: %d obs (%.2f%%) > 24h, max = %.1f hours\n",
+    sum(data_pooled$total_convo_duration > DURATION_CAP_SEC),
+    100 * mean(data_pooled$total_convo_duration > DURATION_CAP_SEC),
+    max(data_pooled$total_convo_duration) / 3600))
+cat(sprintf("  App:   %d obs > 24h, max = %.1f hours (no censoring needed)\n",
+    sum(data_pooled$total_app_duration > DURATION_CAP_SEC),
+    max(data_pooled$total_app_duration) / 3600))
+
+# Apply censoring (cap at 24 hours)
+data_pooled <- data_pooled %>%
+  mutate(
+    total_call_duration = pmin(total_call_duration, DURATION_CAP_SEC),
+    total_convo_duration = pmin(total_convo_duration, DURATION_CAP_SEC)
+  )
+
+# Read fixed EMA data (for verification and ID list)
+data_ema <- read_csv(here::here("data", "data_ema_6_05142025.csv"))
+
+# Use imputation 1 for exploratory analyses (correlation, visualization)
+# Note: daily_phq_mean (item average, 0-100 scale) used instead of daily_phq_total
+data_new <- data_pooled %>%
+  filter(.imp == 1) %>%
+  select(-daily_phq_total, -.imp)
+
+```
+
+```{r}
+
+
+# Check if any NA
+print(colSums(is.na(data_new)))
+
+# Verification
+verification <- data_new %>%
+  group_by(uid) %>%
+  summarise(
+    n_dates = n_distinct(date),
+    min_date = min(date),
+    max_date = max(date),
+    n_bins = n_distinct(bin_dates)
+  )
+
+head(verification)
+
+table(verification$uid) # 300 pts
+table(verification$n_dates) # each pt has 90 days data
+table(verification$n_bins)
+
+# Load EMA data with 300 TD participants
+data_ema <- read_csv(here::here("data", "3._TD_cohort_EMA_FINAL.csv")) %>%
+  janitor::clean_names() # convert column names to lower snake case
+
+# Create a ID list for these 300 pts
+IDlist <- unique(data_ema$mlife_id)
+IDlist_clean <- unique(data_new$uid)
+# Check if they're the same ID list
+identical(IDlist, IDlist_clean) # True!
+
+colnames(data_ema)
+```
+
+### Table 1: Sample Demographics
+```{r table1-demographics}
+# Read demographics (skip row 2 which contains survey question text)
+demo <- read_csv(here::here("data", "9._FinalDemographics.csv")) %>% slice(-1) %>% slice(1:(n() - 2))
+
+demo <- demo %>%
+  rename(
+    uid = MLife_ID,
+    age = `Age at Study Start`,
+    gender = Gender,
+    race = Race_For_Reporting,
+    ethnicity = Hispanic_Latino,
+    education = Highest_Level_Education,
+    income = Income,
+    sexual_orientation = Sexual_Orientation,
+    transgender = Transgender
+  ) %>%
+  filter(uid %in% unique(data_pooled$uid)) %>%
+  select(uid, age, gender, race, ethnicity, education, income,
+         sexual_orientation, transgender) %>%
+  mutate(
+    age = as.numeric(age),
+    race = case_when(
+      grepl("White", race) ~ "White",
+      grepl("Black", race) ~ "Black or African American",
+      grepl("Asian", race) ~ "Asian",
+      grepl("American Indian", race) ~ "American Indian or Alaska Native",
+      grepl("Multiple", race) ~ "Multiracial",
+      TRUE ~ "Other/Not reported"
+    ),
+    ethnicity = case_when(
+      grepl("None", ethnicity) ~ "Non-Hispanic/Latino",
+      grepl("Yes", ethnicity) ~ "Hispanic/Latino",
+      TRUE ~ "Not reported"
+    ),
+    # Note: CSV contains Windows-1252 right single quote (\x92) in
+    # "Bachelor\x92s" and "Master\x92s" — use partial patterns that
+    # avoid the apostrophe to ensure matching
+    education = case_when(
+      grepl("Master|Doctoral|Professional", education) ~ "Graduate degree",
+      grepl("Bachelor", education) ~ "Bachelor's degree",
+      grepl("Associate|Some college|Trade", education) ~ "Some college/Associate",
+      grepl("High school|GED", education) ~ "High school/GED",
+      grepl("Less than high school", education) ~ "Less than high school",
+      TRUE ~ "Not reported"
+    )
+  )
+
+table1 <- demo %>%
+  select(-uid) %>%
+  tbl_summary(
+    type = list(age ~ "continuous"),
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      age ~ "Age (years)",
+      gender ~ "Gender",
+      race ~ "Race",
+      ethnicity ~ "Ethnicity",
+      education ~ "Education",
+      income ~ "Household Income",
+      sexual_orientation ~ "Sexual Orientation",
+      transgender ~ "Transgender Identity"
+    ),
+    digits = list(
+      all_continuous() ~ 2,
+      all_categorical() ~ c(0, 1)
+    ),
+    missing = "no"
+  ) %>%
+  bold_labels()
+
+table1
+
+# Export to Word
+table1 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = here::here("results", "Table1_demographics_v3.2.1.docx"))
+```
+
+## Correlation Analysis
+
+### Daily-Level: Online vs. In-Person Independence
+
+Are online and in-person social contact substitutes or independent at the daily level?
+
+```{r}
+# Daily-level correlation between online and in-person interaction
+# Tests whether these modalities co-occur or substitute within days
+data_daily <- data_new %>%
+  mutate(total_app_duration = round(total_app_duration),
+         total_online = total_call_duration + total_app_duration)
+
+daily_cor <- cor.test(data_daily$total_online, data_daily$total_convo_duration,
+                      use = "pairwise.complete.obs", method = "pearson")
+cat("Daily-level correlation: online vs. in-person interaction\n")
+cat("  r =", round(daily_cor$estimate, 3), "\n")
+cat(sprintf("  95%% CI [%.2f, %.2f]\n", daily_cor$conf.int[1], daily_cor$conf.int[2]))
+cat("  p =", round(daily_cor$p.value, 4), "\n")
+cat("  N (daily obs) =", nrow(data_daily), "\n")
+cat(sprintf("  For manuscript: r(%d) = %.2f, 95%% CI [%.2f, %.2f], p = %.3f\n",
+            daily_cor$parameter, daily_cor$estimate,
+            daily_cor$conf.int[1], daily_cor$conf.int[2], daily_cor$p.value))
+cat("  Note: p reflects large N; interpret effect size (r ≈ 0 = independent)\n")
+```
+
+### Person-Level: Predictors vs. Depression
+
+Between-person correlations aggregated to person means (*N* = 300).
+
+```{r}
+# Person-level correlation: aggregate daily observations to person means (N = 300)
+# This avoids inflated df from nested daily observations within persons
+data_cor <- data_new %>%
+  mutate(total_app_duration = round(total_app_duration),
+         # Create an aggregated measure of online interaction
+         total_online = total_call_duration + total_app_duration,
+         # Total social interaction (online + in-person)
+         total_social = total_online + total_convo_duration,
+         # Proportion of online interactions (the complement will be in-person)
+         prop_online = if_else(total_social > 0, total_online / total_social, NA_real_),
+         # Proportion of in-person interactions (the complement will be online)
+         prop_in_person = if_else(total_social > 0, total_convo_duration / total_social, NA_real_)
+         ) %>%
+  group_by(uid) %>%
+  summarize(across(c(daily_phq_mean, total_call_duration, total_app_duration,
+                     total_convo_duration, total_online, total_social,
+                     prop_online, prop_in_person), mean, na.rm = TRUE),
+            .groups = "drop") %>%
+  select(-uid)
+```
+
+```{r}
+library(corrplot)
+# Let's take a look at correlation between variables
+cor(data_cor, use = 'pairwise.complete.obs', method = "pearson")
+
+# corr.test() gives us p-value of correlation
+cor <- corr.test(data_cor,
+                 use = "pairwise.complete.obs", method="pearson", alpha=.05, adjust="none") # if needed adjustment for multiple tests
+
+# Plot it!
+print(corrplot(cor$r, method="pie", type="upper", # what if you change "circle" to "number"?
+               p.mat = cor$p, sig.level=0.05, insig = "blank", na.label = "?",
+               order="original"))
+
+# Export a jpg file to a folder called "plot" in your working directory
+# file_path= paste0("./plot/Correlation matrix_number_", Sys.Date(), ".jpg")
+# jpeg(height=10, width=10, units = "in", res = 800, file=file_path, type = "cairo")
+#
+# corrplot(cor$r, method="number", type="upper",
+#          p.mat = cor$p, sig.level=0.05, insig = "blank", na.label = "?",
+#          order="original",
+#          title = "Correlation Plot",
+#          mar = c(0,0,1,0),
+#          number.cex = 0.5,
+#          number.digits = 2)
+#
+# dev.off()
+
+print(corrplot(cor$r, method="number", type="upper", # minoritized_so everyone==1
+               p.mat = cor$p, sig.level=0.05, insig = "p-value", na.label = "?",
+               order="original"))
+
+cor$r
+cor$p
+```
+
+### Table 2: Descriptive Statistics for Main Study Variables
+```{r table2-descriptives}
+# Use imputation 1 data (pre-detrending) for descriptive stats
+data_imp1 <- data_pooled %>% filter(.imp == 1)
+
+# Convert durations from seconds to minutes for interpretability
+table2_data <- data_imp1 %>%
+  mutate(
+    call_duration_min = total_call_duration / 60,
+    app_duration_min = total_app_duration / 60,
+    convo_duration_min = total_convo_duration / 60,
+    total_social_min = (total_call_duration + total_app_duration + total_convo_duration) / 60,
+    prop_online = if_else(
+      (total_call_duration + total_app_duration + total_convo_duration) > 0,
+      (total_call_duration + total_app_duration) /
+        (total_call_duration + total_app_duration + total_convo_duration),
+      NA_real_
+    )
+  )
+
+table2 <- table2_data %>%
+  select(
+    daily_phq_mean,
+    call_duration_min,
+    app_duration_min,
+    convo_duration_min,
+    prop_online,
+    total_social_min
+  ) %>%
+  tbl_summary(
+    type = everything() ~ "continuous",
+    statistic = all_continuous() ~ "{mean} ({sd})",
+    label = list(
+      daily_phq_mean ~ "Daily PHQ-9 Mean (Item Average)",
+      call_duration_min ~ "Total Call Duration (min)",
+      app_duration_min ~ "Total App Usage Duration (min)",
+      convo_duration_min ~ "Total Conversation Duration (min)",
+      prop_online ~ "Proportion of Online Interaction",
+      total_social_min ~ "Total Social Interaction (min)"
+    ),
+    digits = all_continuous() ~ 2,
+    missing = "no"
+  ) %>%
+  bold_labels()
+
+table2
+
+# Export to Word
+table2 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = here::here("results", "Table2_descriptives_v3.2.1.docx"))
+```
+
+## mlVAR
+### Step 1: Data Aggregation
+```{r}
+# --------------------------------------- #
+# Step 1: Data Preparation & Aggregation  #
+# --------------------------------------- #
+
+data_aggregated <- data_new %>%
+  mutate(total_app_duration = round(total_app_duration),
+         date = as.Date(date),
+         # Create an aggregated measure of online interaction
+         total_online = total_call_duration + total_app_duration,
+         # Total social interaction (online + in-person)
+         total_social = total_online + total_convo_duration,
+         # Proportion of online interactions (the complement will be in-person)
+         prop_online = if_else(total_social > 0, total_online / total_social, NA_real_),
+         # Proportion of in-person interactions (the complement will be online)
+         prop_in_person = if_else(total_social > 0, total_convo_duration / total_social, NA_real_),
+         # Create a numeric time variable for GAM:
+         time_numeric = as.numeric(date)
+         )
+```
+
+### Step 2: Population-Level Detrending
+```{r}
+# -----------------------------------------------
+# Step 2: Detrend the Data (Population-Level GAM)
+# -----------------------------------------------
+# A single GAM is fit across ALL participants' pooled data to remove
+# population-level time trends while preserving within-person autoregressive
+# signal. k=20 is used given the large pooled sample (~27,000 rows).
+# Per PI recommendation: within-person GAM can over-detrend and remove
+# real autoregressive signal that mlVAR needs to estimate.
+
+GAM_K <- 20  # basis dimension for population-level GAM
+
+# Fit GAMs on pooled data (no grouping by uid)
+gam_phq <- gam(daily_phq_mean ~ s(bin_dates, k = GAM_K), data = data_aggregated, na.action = na.exclude)
+gam_prop_online <- gam(prop_online ~ s(bin_dates, k = GAM_K), data = data_aggregated, na.action = na.exclude)
+gam_prop_in_person <- gam(prop_in_person ~ s(bin_dates, k = GAM_K), data = data_aggregated, na.action = na.exclude)
+gam_total_social <- gam(total_social ~ s(bin_dates, k = GAM_K), data = data_aggregated, na.action = na.exclude)
+
+data_detrended <- data_aggregated %>%
+  mutate(
+    daily_phq_mean_detrend = resid(gam_phq),
+    prop_online_detrend = resid(gam_prop_online),
+    prop_in_person_detrend = resid(gam_prop_in_person),
+    total_social_detrend = resid(gam_total_social)
+  )
+
+## Viz: Before vs. After Detrending
+ggplot(data = data_detrended, aes(x = bin_dates, y = daily_phq_mean, group = uid, color=factor(uid))) +
+  geom_point() + geom_line() + theme(legend.position="none") +
+  labs(title = "Raw PHQ-9 Mean (Item Average)")
+
+ggplot(data = data_detrended, aes(x = bin_dates, y = daily_phq_mean_detrend, group = uid, color=factor(uid))) +
+  geom_point() + geom_line() + theme(legend.position="none") +
+  labs(title = "Population-Level Detrended PHQ-9 Mean")
+
+ggplot(data = data_detrended, aes(x = bin_dates, y = prop_online, group = uid, color=factor(uid))) +
+  geom_point() + geom_line() + theme(legend.position="none") +
+  labs(title = "Raw Proportion Online")
+
+ggplot(data = data_detrended, aes(x = bin_dates, y = prop_online_detrend, group = uid, color=factor(uid))) +
+  geom_point() + geom_line() + theme(legend.position="none") +
+  labs(title = "Population-Level Detrended Proportion Online")
+
+ggplot(data = data_detrended, aes(x = bin_dates, y = prop_in_person, group = uid, color=factor(uid))) +
+  geom_point() + geom_line() + theme(legend.position="none") +
+  labs(title = "Raw Proportion In-Person")
+
+ggplot(data = data_detrended, aes(x = bin_dates, y = prop_in_person_detrend, group = uid, color=factor(uid))) +
+  geom_point() + geom_line() + theme(legend.position="none") +
+  labs(title = "Population-Level Detrended Proportion In-Person")
+```
+
+### Step 2b: Stationarity Testing
+```{r stationarity-tests}
+# -----------------------------------------------
+# Verify stationarity assumption using ADF tests
+# -----------------------------------------------
+# Run ADF test on each participant's detrended series.
+# H0: series has a unit root (non-stationary)
+# We want to reject H0 (p < 0.05) for stationarity.
+
+vars_to_test <- c("daily_phq_mean_detrend", "prop_online_detrend",
+                   "prop_in_person_detrend", "total_social_detrend")
+
+stationarity_results <- data_detrended %>%
+  group_by(uid) %>%
+  summarise(
+    across(all_of(vars_to_test), function(x) {
+      tryCatch(
+        adf.test(x, alternative = "stationary")$p.value,
+        error = function(e) NA_real_
+      )
+    }, .names = "adf_p_{.col}"),
+    .groups = "drop"
+  )
+
+# Summarize: proportion of participants with stationary series (p < 0.05)
+stationarity_summary <- stationarity_results %>%
+  summarise(
+    across(starts_with("adf_p_"), list(
+      prop_stationary = ~ mean(. < 0.05, na.rm = TRUE),
+      median_p = ~ median(., na.rm = TRUE),
+      n_failed = ~ sum(is.na(.))
+    ))
+  ) %>%
+  pivot_longer(everything(), names_to = "metric", values_to = "value")
+
+cat("\n=== Stationarity Test Summary (ADF) ===\n")
+cat("Proportion of participants with stationary series (p < 0.05):\n\n")
+
+for (var in vars_to_test) {
+  col <- paste0("adf_p_", var)
+  prop <- mean(stationarity_results[[col]] < 0.05, na.rm = TRUE)
+  med_p <- median(stationarity_results[[col]], na.rm = TRUE)
+  n_na <- sum(is.na(stationarity_results[[col]]))
+  cat(sprintf("  %s: %.1f%% stationary (median p = %.4f, %d failed)\n",
+              var, prop * 100, med_p, n_na))
+}
+```
+
+### Step 3: Within-Person Centering
+```{r}
+# -------------------------------
+# Step 3: Within-Person Centering
+# -------------------------------
+# Within-Person Center: Subtract an individual's score by their mean
+# to avoid conflating within-person variation with between-person variation.
+# Note: With population-level detrending (v3), the detrended residuals do NOT
+# have mean ~0 per person (unlike within-person detrending in v2). Within-person
+# centering is therefore more consequential here, properly separating within-
+# and between-person variance for mlVAR.
+
+data_centered <- data_detrended %>%
+  group_by(uid) %>%
+  mutate(across(c(daily_phq_mean_detrend, prop_online_detrend,
+                  prop_in_person_detrend, total_social_detrend),
+                ~ . - mean(., na.rm = TRUE))) %>%
+  ungroup() %>%
+  arrange(uid, bin_dates)
+
+# Create readable variable names for the online model
+data_centered$Depression <- data_centered$daily_phq_mean_detrend
+data_centered$Online <- data_centered$prop_online_detrend
+```
+
+### Step 4: Run mlVAR Models (Single Imputation — Exploratory)
+```{r mlvar-single-imputation}
+# -------------------------------
+# Step 4a: mlVAR on imputation 1 (for quick exploration)
+# -------------------------------
+
+# v3.2.1: helper for explicit listwise deletion on a per-model basis.
+# Drops any row with NA in any of the variables passed to mlVAR. Also
+# reports how many person-days were excluded so we can document the
+# impact in the manuscript.
+make_complete <- function(d, v, label = NULL) {
+  before <- nrow(d)
+  out <- d %>% dplyr::filter(dplyr::if_all(dplyr::all_of(v), ~ !is.na(.)))
+  after <- nrow(out)
+  cat(sprintf("[listwise] %s: dropped %d / %d rows (%.2f%%)\n",
+              label %||% paste(v, collapse = "+"),
+              before - after, before, 100 * (before - after) / before))
+  out
+}
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# Model 1: Depression ~ Online proportion
+vars_online <- c("Depression", "Online")
+mlvar_result_online <- mlVAR(
+  data = make_complete(data_centered, vars_online, "online"),
+  vars = vars_online,
+  idvar = "uid",
+  lags = 1,
+  temporal = "fixed",
+  contemporaneous = "correlated",
+  estimator = "lmer"
+)
+summary(mlvar_result_online)
+
+# Model 2: Depression ~ In-person proportion
+vars_in_person <- c("daily_phq_mean_detrend", "prop_in_person_detrend")
+mlvar_result_in_person <- mlVAR(
+  data = make_complete(data_centered, vars_in_person, "in_person"),
+  vars = vars_in_person,
+  idvar = "uid",
+  lags = 1,
+  temporal = "fixed",
+  contemporaneous = "correlated",
+  estimator = "lmer"
+)
+summary(mlvar_result_in_person)
+
+# Model 3: Depression ~ Total social (2-variable)
+vars_total_2 <- c("daily_phq_mean_detrend", "total_social_detrend")
+mlvar_result_total_2var <- mlVAR(
+  data = make_complete(data_centered, vars_total_2, "total_2var"),
+  vars = vars_total_2,
+  idvar = "uid",
+  lags = 1,
+  temporal = "fixed",
+  contemporaneous = "correlated",
+  estimator = "lmer"
+)
+summary(mlvar_result_total_2var)
+
+# Model 4: Depression ~ Total social + In-person proportion (3-variable)
+vars_total_3 <- c("daily_phq_mean_detrend", "total_social_detrend", "prop_in_person_detrend")
+mlvar_result_total_3var <- mlVAR(
+  data = make_complete(data_centered, vars_total_3, "total_3var"),
+  vars = vars_total_3,
+  idvar = "uid",
+  lags = 1,
+  temporal = "fixed",
+  contemporaneous = "correlated",
+  estimator = "lmer"
+)
+summary(mlvar_result_total_3var)
+```
+
+### Step 4b: Rubin's Rules — Pool mlVAR Across All Imputations
+
+```{r rubins-rules-helpers, cache=FALSE}
+# -----------------------------------------------
+# Helper functions for Rubin's rules pooling
+# -----------------------------------------------
+
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(stringr)
+library(magrittr)
+
+# Extract fixed-effect coefficients and SEs from an mlVAR temporal model
+extract_temporal_effects <- function(mlvar_obj) {
+  temporal_models <- mlvar_obj$output$temporal
+  vars <- mlvar_obj$input$vars
+  results <- list()
+
+  for (j in seq_along(temporal_models)) {
+    coefs <- summary(temporal_models[[j]])$coefficients
+    outcome <- vars[j]
+
+    for (k in seq_len(nrow(coefs))) {
+      predictor <- rownames(coefs)[k]
+      if (predictor == "(Intercept)") next
+
+      predictor_label <- predictor
+      if (grepl("^Predictor__", predictor)) {
+        pred_num <- as.integer(stringr::str_extract(predictor, "\\d+$"))
+        if (is.na(pred_num) || pred_num > length(vars)) next
+        predictor_label <- vars[pred_num]
+      }
+
+      results[[length(results) + 1]] <- tibble(
+        type = "temporal",
+        outcome = outcome,
+        predictor = predictor_label,
+        estimate = coefs[k, "Estimate"],
+        se = coefs[k, "Std. Error"]
+      )
+    }
+  }
+
+  if (length(results) == 0) {
+    return(tibble(type = character(), outcome = character(),
+                  predictor = character(), estimate = numeric(), se = numeric()))
+  }
+  bind_rows(results)
+}
+
+# Extract fixed-effect coefficients and SEs from contemporaneous model
+extract_contemporaneous_effects <- function(mlvar_obj) {
+  contemp_models <- mlvar_obj$output$contemporaneous
+  vars <- mlvar_obj$input$vars
+  results <- list()
+
+  for (j in seq_along(contemp_models)) {
+    coefs <- summary(contemp_models[[j]])$coefficients
+    outcome <- if (j <= length(vars)) vars[j] else names(contemp_models)[j]
+    if (is.null(outcome) || is.na(outcome) || outcome == "") outcome <- paste0("contemp_", j)
+
+    for (k in seq_len(nrow(coefs))) {
+      predictor <- rownames(coefs)[k]
+      if (predictor == "(Intercept)") next
+
+      results[[length(results) + 1]] <- tibble(
+        type = "contemporaneous",
+        outcome = outcome,
+        predictor = predictor,
+        estimate = coefs[k, "Estimate"],
+        se = coefs[k, "Std. Error"]
+      )
+    }
+  }
+
+  if (length(results) == 0) {
+    return(tibble(type = character(), outcome = character(),
+                  predictor = character(), estimate = numeric(), se = numeric()))
+  }
+  bind_rows(results) %>%
+    mutate(
+      var_a = pmin(outcome, predictor),
+      var_b = pmax(outcome, predictor)
+    ) %>%
+    group_by(type, var_a, var_b) %>%
+    summarize(
+      outcome = first(var_a),
+      predictor = first(var_b),
+      estimate = mean(estimate, na.rm = TRUE),
+      se = mean(se, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+# Pool results using Rubin's rules
+pool_rubins <- function(estimates, ses, m) {
+  # estimates_list: list of m estimate vectors (each imputation)
+  # se_list: list of m SE vectors (each imputation)
+
+  Q_bar <- mean(estimates)  # Pooled estimate
+  U_bar <- mean(ses^2)  # Mean within-imputation variance
+
+  B <- if (m > 1) stats::var(estimates) else 0  # Between-imputation variance
+
+  T_total <- U_bar + (1 + 1/m) * B  # Total variance
+  pooled_se <- sqrt(T_total)
+
+  # Degrees of freedom (Barnard & Rubin, 1999)
+  lambda <- ifelse(T_total > 0, ((1 + 1/m) * B) / T_total, 0)  # Fraction of missing information
+  df_old <- ifelse(lambda > 0, (m - 1) / lambda^2, Inf)
+
+  # t-statistic and p-value
+  t_stat <- Q_bar / pooled_se
+  p_value <- 2 * pt(-abs(t_stat), df = pmax(df_old, 1))
+
+  # Degrees of freedom (floored at 1)
+  df_use <- ifelse(is.finite(df_old), pmax(df_old, 1), 1e6)
+
+  # 95% confidence intervals using t-distribution
+  ci_lower <- Q_bar - qt(0.975, df_use) * pooled_se
+  ci_upper <- Q_bar + qt(0.975, df_use) * pooled_se
+
+  tibble(
+    pooled_estimate = Q_bar,
+    pooled_se = pooled_se,
+    df = df_use,
+    ci_lower = ci_lower,
+    ci_upper = ci_upper,
+    t_stat = t_stat,
+    p_value = p_value,
+    fmi = lambda  # fraction of missing information
+  )
+}
+```
+
+```{r rubins-rules-run, cache=FALSE}
+# -----------------------------------------------
+# Run mlVAR on each imputation and pool
+# -----------------------------------------------
+# This section runs the full detrend -> center -> mlVAR pipeline on each of the
+# m=5 imputed datasets and pools results using Rubin's rules.
+
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(magrittr)
+library(mgcv)
+library(mlVAR)
+
+run_mlvar_pipeline <- function(data_imp, vars, GAM_K = 20) {
+  # Step 1: Aggregate
+  data_agg <- data_imp %>%
+    mutate(
+      total_app_duration = round(total_app_duration),
+      date = as.Date(date),
+      total_online = total_call_duration + total_app_duration,
+      total_social = total_online + total_convo_duration,
+      prop_online = if_else(total_social > 0, total_online / total_social, NA_real_),
+      prop_in_person = if_else(total_social > 0, total_convo_duration / total_social, NA_real_),
+      time_numeric = as.numeric(date)
+    )
+
+  # Step 2: Population-level detrending (single GAM across all participants)
+  gam_phq <- gam(daily_phq_mean ~ s(bin_dates, k = GAM_K), data = data_agg, na.action = na.exclude)
+  gam_prop_online <- gam(prop_online ~ s(bin_dates, k = GAM_K), data = data_agg, na.action = na.exclude)
+  gam_prop_in_person <- gam(prop_in_person ~ s(bin_dates, k = GAM_K), data = data_agg, na.action = na.exclude)
+  gam_total_social <- gam(total_social ~ s(bin_dates, k = GAM_K), data = data_agg, na.action = na.exclude)
+
+  data_det <- data_agg %>%
+    mutate(
+      daily_phq_mean_detrend = resid(gam_phq),
+      prop_online_detrend = resid(gam_prop_online),
+      prop_in_person_detrend = resid(gam_prop_in_person),
+      total_social_detrend = resid(gam_total_social)
+    )
+
+  # Step 3: Within-person centering
+  data_cent <- data_det %>%
+    group_by(uid) %>%
+    mutate(across(c(daily_phq_mean_detrend, prop_online_detrend,
+                    prop_in_person_detrend, total_social_detrend),
+                  ~ . - mean(., na.rm = TRUE))) %>%
+    ungroup() %>%
+    arrange(uid, bin_dates)
+
+  # Create readable names if needed
+  if ("Depression" %in% vars) {
+    data_cent$Depression <- data_cent$daily_phq_mean_detrend
+  }
+  if ("Online" %in% vars) {
+    data_cent$Online <- data_cent$prop_online_detrend
+  }
+
+  # v3.2.1: Explicit listwise deletion BEFORE mlVAR.
+  # Drops any row with NA in any variable used by this specific model.
+  # In v3.2 we relied on mlVAR's internal NA handling; here we make the
+  # listwise step explicit so we can verify the two are equivalent.
+  before <- nrow(data_cent)
+  data_cent <- data_cent %>%
+    dplyr::filter(dplyr::if_all(dplyr::all_of(vars), ~ !is.na(.)))
+  after <- nrow(data_cent)
+  cat(sprintf("    [listwise] %s: dropped %d / %d rows (%.2f%%)\n",
+              paste(vars, collapse = "+"), before - after, before,
+              100 * (before - after) / before))
+
+  # Step 4: Run mlVAR
+  result <- mlVAR(
+    data = data_cent,
+    vars = vars,
+    idvar = "uid",
+    lags = 1,
+    temporal = "fixed",
+    contemporaneous = "correlated",
+    estimator = "lmer"
+  )
+
+  return(result)
+}
+
+# ---- Run all models across all imputations ----
+
+model_specs <- list(
+  online = c("Depression", "Online"),
+  in_person = c("daily_phq_mean_detrend", "prop_in_person_detrend"),
+  total_2var = c("daily_phq_mean_detrend", "total_social_detrend"),
+  total_3var = c("daily_phq_mean_detrend", "total_social_detrend", "prop_in_person_detrend")
+)
+
+IMPUTATION_M <- dplyr::n_distinct(data_pooled$.imp)
+pooled_results <- list()
+
+for (model_name in names(model_specs)) {
+  cat("\n=== Running model:", model_name, "across", IMPUTATION_M, "imputations ===\n")
+
+  imp_temporal <- list()
+  imp_contemp <- list()
+
+  for (i in 1:IMPUTATION_M) {
+    cat("  Imputation", i, "...")
+    data_imp <- data_pooled %>% filter(.imp == i) %>% select(-.imp)
+
+    result_i <- run_mlvar_pipeline(data_imp, model_specs[[model_name]])
+
+    imp_temporal[[i]] <- extract_temporal_effects(result_i)
+    imp_contemp[[i]] <- extract_contemporaneous_effects(result_i)
+    cat(" done\n")
+  }
+
+  # Pool temporal effects
+  if (nrow(imp_temporal[[1]]) > 0) {
+    temporal_long <- map2_dfr(imp_temporal, seq_along(imp_temporal), ~ .x %>% mutate(.imp = .y))
+    temporal_keys <- temporal_long %>%
+      count(type, outcome, predictor) %>%
+      filter(n == IMPUTATION_M) %>%
+      select(type, outcome, predictor)
+
+    temporal_pooled <- temporal_long %>%
+      semi_join(temporal_keys, by = c("type", "outcome", "predictor")) %>%
+      group_by(type, outcome, predictor) %>%
+      summarize(
+        pooled = list(pool_rubins(estimate, se, IMPUTATION_M)),
+        .groups = "drop"
+      ) %>%
+      tidyr::unnest(pooled) %>%
+      mutate(
+        effect = paste(outcome, "\u2190", predictor, "(lag-1)"),
+        model = model_name
+      )
+  } else {
+    temporal_pooled <- tibble()
+  }
+
+  # Pool contemporaneous effects
+  if (nrow(imp_contemp[[1]]) > 0) {
+    contemp_long <- map2_dfr(imp_contemp, seq_along(imp_contemp), ~ .x %>% mutate(.imp = .y))
+    contemp_keys <- contemp_long %>%
+      count(type, outcome, predictor) %>%
+      filter(n == IMPUTATION_M) %>%
+      select(type, outcome, predictor)
+
+    contemp_pooled <- contemp_long %>%
+      semi_join(contemp_keys, by = c("type", "outcome", "predictor")) %>%
+      group_by(type, outcome, predictor) %>%
+      summarize(
+        pooled = list(pool_rubins(estimate, se, IMPUTATION_M)),
+        .groups = "drop"
+      ) %>%
+      tidyr::unnest(pooled) %>%
+      mutate(
+        effect = paste(outcome, "\u2194", predictor),
+        model = model_name
+      )
+  } else {
+    contemp_pooled <- tibble()
+  }
+
+  pooled_results[[model_name]] <- bind_rows(temporal_pooled, contemp_pooled)
+}
+
+# Combine all pooled results
+all_pooled <- bind_rows(pooled_results)
+```
+
+```{r rubins-results-display, cache=FALSE}
+library(dplyr)
+library(readr)
+
+# -----------------------------------------------
+# Display pooled results
+# -----------------------------------------------
+cat("\n====================================\n")
+cat("  POOLED RESULTS (Rubin's Rules)  \n")
+cat("====================================\n\n")
+
+for (model_name in names(pooled_results)) {
+  cat("\n--- Model:", model_name, "---\n\n")
+
+  res <- pooled_results[[model_name]]
+
+  if (nrow(res) == 0) {
+    cat("  No effects extracted.\n")
+    next
+  }
+
+  # Temporal effects
+  temporal <- res %>% filter(type == "temporal")
+  if (nrow(temporal) > 0) {
+    cat("  Temporal (lag-1) effects:\n")
+    for (j in 1:nrow(temporal)) {
+      sig <- ifelse(temporal$p_value[j] < 0.001, "***",
+                    ifelse(temporal$p_value[j] < 0.01, "**",
+                           ifelse(temporal$p_value[j] < 0.05, "*", "")))
+      cat(sprintf("    %-50s  B = %7.4f  95%% CI [%7.4f, %7.4f]  SE = %7.4f  p = %.4f %s  FMI = %.2f\n",
+                  temporal$effect[j],
+                  temporal$pooled_estimate[j],
+                  temporal$ci_lower[j],
+                  temporal$ci_upper[j],
+                  temporal$pooled_se[j],
+                  temporal$p_value[j],
+                  sig,
+                  temporal$fmi[j]))
+    }
+  }
+
+  # Contemporaneous effects
+  contemp <- res %>% filter(type == "contemporaneous")
+  if (nrow(contemp) > 0) {
+    cat("\n  Contemporaneous effects:\n")
+    for (j in 1:nrow(contemp)) {
+      sig <- ifelse(contemp$p_value[j] < 0.001, "***",
+                    ifelse(contemp$p_value[j] < 0.01, "**",
+                           ifelse(contemp$p_value[j] < 0.05, "*", "")))
+      cat(sprintf("    %-50s  B = %7.4f  95%% CI [%7.4f, %7.4f]  SE = %7.4f  p = %.4f %s  FMI = %.2f\n",
+                  contemp$effect[j],
+                  contemp$pooled_estimate[j],
+                  contemp$ci_lower[j],
+                  contemp$ci_upper[j],
+                  contemp$pooled_se[j],
+                  contemp$p_value[j],
+                  sig,
+                  contemp$fmi[j]))
+    }
+  }
+  cat("\n")
+}
+
+# Save pooled results
+readr::write_csv(all_pooled, here::here("results", "mlvar_pooled_results_v3.2.1.csv"))
+cat("Pooled results saved to results/mlvar_pooled_results_v3.2.1.csv\n")
+```
+
+### Step 5: Plotting (Single Imputation)
+```{r plotting-single-imp}
+# -----------------------------------------------
+# Visualization using imputation-1 models
+# -----------------------------------------------
+
+# Temporal networks
+plot(mlvar_result_online, "temporal", layout = "circle", nonsig = "hide")
+title("Within-person temporal (lag-1) relations — Online Model")
+
+plot(mlvar_result_online, "temporal", layout = "circle", nonsig = "hide", SD = TRUE)
+title("SD of Random Effects of Lagged Associations — Online Model")
+
+# Contemporaneous networks
+plot(mlvar_result_online, "contemporaneous", layout = "circle", nonsig = "hide")
+title("Within-person contemporaneous relations — Online Model")
+
+# Total social model plots
+plot(mlvar_result_total_3var, "temporal", layout = "circle", nonsig = "hide")
+title("Within-person temporal (lag-1) relations — 3-Variable Model")
+
+plot(mlvar_result_total_3var, "contemporaneous", layout = "circle", nonsig = "hide")
+title("Within-person contemporaneous relations — 3-Variable Model")
+```
+
+```{r plotting-side-by-side}
+# Side-by-side network plots (Online model)
+edge_color <- "#4F46E5"
+png(here::here("figures", "mlvar_plots_indigo_two_v3.png"), width = 12, height = 6, units = "in", res = 300)
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 2), oma = c(2, 0, 0, 0))
+
+plot(mlvar_result_online, "temporal", layout = "circle", nonsig = "hide", edge.color = edge_color)
+title("a) Within-person temporal (lag-1) relations", cex.main = 1.2)
+# mtext("A", side = 3, line = 1, at = par("usr")[1] - 0.1 * diff(par("usr")[1:2]),
+#       cex = 1.5, font = 2, xpd = NA)
+
+plot(mlvar_result_online, "contemporaneous", layout = "circle", nonsig = "hide", edge.color = edge_color)
+title("b) Within-person contemporaneous relations", cex.main = 1.2)
+# mtext("B", side = 3, line = 1, at = par("usr")[1] - 0.1 * diff(par("usr")[1:2]),
+#       cex = 1.5, font = 2, xpd = NA)
+
+mtext("Note: Blue edges indicate positive associations", side = 1, line = 0.5, outer = TRUE,
+      cex = 0.9, col = "gray30")
+
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1, oma = c(0, 0, 0, 0))
+dev.off()
+
+jpeg(here::here("figures", "mlvar_plots_indigo_two_v3.jpg"),
+     width = 12, height = 6, units = "in", res = 300, quality = 100)
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 2), oma = c(2, 0, 0, 0))
+
+plot(mlvar_result_online, "temporal", layout = "circle", nonsig = "hide", edge.color = edge_color)
+title("(a) Within-person temporal (lag-1) relations", cex.main = 1.2)
+# mtext("A", side = 3, line = 1, at = par("usr")[1] - 0.1 * diff(par("usr")[1:2]),
+#       cex = 1.5, font = 2, xpd = NA)
+
+plot(mlvar_result_online, "contemporaneous", layout = "circle", nonsig = "hide", edge.color = edge_color)
+title("(b) Within-person contemporaneous relations", cex.main = 1.2)
+# mtext("B", side = 3, line = 1, at = par("usr")[1] - 0.1 * diff(par("usr")[1:2]),
+#       cex = 1.5, font = 2, xpd = NA)
+
+mtext("Note: Blue edges indicate positive associations", side = 1, line = 0.5, outer = TRUE,
+      cex = 0.9, col = "gray30")
+
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1, oma = c(0, 0, 0, 0))
+dev.off()
+```
+
+### Plotting: Individual Differences (Caterpillar Plots)
+```{r caterpillar-plots}
+library(lattice)
+
+# Online model caterpillar
+dd <- data.frame(ranef(mlvar_result_online$output$contemporaneous[[1]]))
+dd <- dd %>% arrange(desc(condval))
+dd$participant_rank <- 1:nrow(dd)
+
+plot_manuscript <- ggplot(dd, aes(y = participant_rank, x = condval)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", alpha = 0.7) +
+  geom_errorbarh(aes(xmin = condval - 2*condsd,
+                     xmax = condval + 2*condsd),
+                 height = 0, alpha = 0.6, color = "gray40") +
+  geom_point(size = 1.2, alpha = 0.8, color = "#4F46E5") +
+  labs(
+    title = "Individual Heterogeneity in Online Social Proportion-Depression Associations",
+    subtitle = "Random slopes showing person-specific contemporaneous relationships (2 SE)",
+    x = "Individual Deviation from Population Effect",
+    y = "Participants (Ranked by Effect Size)"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray30"),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  facet_wrap(~term, scales = "free_x")
+
+print(plot_manuscript)
+ggsave(here::here("figures", "individual_differences_caterpillar_v3.png"), plot_manuscript,
+       width = 10, height = 12, dpi = 500)
+```
+
+```{r}
+# Alternative version with color coding for significant effects
+dd$significant <- abs(dd$condval) > 2 * dd$condsd
+
+plot_manuscript_colored <- ggplot(dd, aes(y = participant_rank, x = condval)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", alpha = 0.7) +
+  geom_errorbarh(aes(xmin = condval - 2*condsd,
+                     xmax = condval + 2*condsd), 
+                 height = 0, alpha = 0.6, color = "gray40") +
+  geom_point(aes(color = significant), size = 1.2, alpha = 0.8) +
+  
+  scale_color_manual(values = c("FALSE" = "#4F46E5", "TRUE" = "red"),
+                     name = "Significant\nDeviation",
+                     labels = c("No", "Yes")) +
+  
+  labs(
+    title = "Individual Heterogeneity in Proportion of Online Social Behavior and Depression Associations",
+    subtitle = "Random slopes showing person-specific contemporaneous relationships (±2 SE)",
+    x = "Individual Deviation from Population Effect",
+    y = "Participants (Ranked by Effect Size)",
+    caption = paste0("Population effect = ", round(fixef(mlvar_result_online$output$contemporaneous[[1]])["Online"], 3), "; N = ", nrow(dd), " participants")
+  ) +
+  
+  theme_classic() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray30"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.caption = element_text(size = 9, color = "gray50"),
+    panel.grid.major.x = element_line(color = "gray90", size = 0.3),
+    legend.position = "bottom",
+    strip.text = element_text(size = 11, face = "bold")
+  ) +
+  
+  facet_wrap(~term, scales = "free_x", 
+             labeller = labeller(term = c("Online" = "Detrended Online Proportion")))
+
+print(plot_manuscript_colored)
+
+# Save high-resolution versions
+ggsave(here::here("figures", "individual_differences_caterpillar_v3.png"), plot_manuscript,
+       width = 10, height = 12, dpi = 500)
+ggsave(here::here("figures", "individual_differences_caterpillar_colored_v3.png"), plot_manuscript_colored,
+       width = 10, height = 12, dpi = 500)
+ggsave(here::here("figures", "individual_differences_caterpillar_v3.jpg"), plot_manuscript,
+       width = 10, height = 12, dpi = 300, device = "jpeg")
+ggsave(here::here("figures", "individual_differences_caterpillar_colored_v3.jpg"), plot_manuscript_colored,
+       width = 10, height = 12, dpi = 300, device = "jpeg")
+```
+
+### Manuscript Values: Slope Range, Between-Person, and Opposite-Pattern %
+```{r manuscript-values}
+# -----------------------------------------------
+# 1. Slope Range (fixed + random for each participant)
+# -----------------------------------------------
+fe_online <- fixef(mlvar_result_online$output$contemporaneous[[1]])["Online"]
+cat("Fixed contemporaneous effect (Online):", fe_online, "\n")
+
+# Extract random deviations
+dd_slopes <- data.frame(ranef(mlvar_result_online$output$contemporaneous[[1]]))
+dd_online <- subset(dd_slopes, term == "Online")
+
+# Compute each participant's absolute slope
+dd_online$abs_slope <- fe_online + dd_online$condval
+
+cat("\nSlope range:\n")
+cat("  Min:", round(min(dd_online$abs_slope), 2), "\n")
+cat("  Max:", round(max(dd_online$abs_slope), 2), "\n")
+cat("  Range for manuscript:", round(min(dd_online$abs_slope), 2),
+    "to", round(max(dd_online$abs_slope), 2), "\n")
+
+# Percentiles
+cat("\nPercentiles:\n")
+print(round(quantile(dd_online$abs_slope, c(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99)), 3))
+
+# -----------------------------------------------
+# 2. Percentage of participants with opposite pattern
+# -----------------------------------------------
+# Population effect is positive; "opposite" = negative slope
+n_opposite <- sum(dd_online$abs_slope < 0)
+pct_opposite <- round(100 * n_opposite / nrow(dd_online), 1)
+cat("\nParticipants with opposite pattern (negative slope):\n")
+cat("  N =", n_opposite, "out of", nrow(dd_online), "\n")
+cat("  Percentage:", pct_opposite, "%\n")
+
+# Participants whose 95% CI excludes 0 AND slope is negative
+n_sig_negative <- sum(dd_online$abs_slope < 0 &
+                      (dd_online$abs_slope + 2 * dd_online$condsd) < 0)
+cat("  Significantly negative (95% CI excludes 0):", n_sig_negative, "\n")
+
+# -----------------------------------------------
+# 3. Between-person correlation
+# -----------------------------------------------
+subject_means <- data_centered %>%
+  group_by(uid) %>%
+  summarize(
+    mean_PHQ = mean(daily_phq_mean_detrend, na.rm = TRUE),
+    mean_prop = mean(prop_online_detrend, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+between_cor <- cor.test(subject_means$mean_prop, subject_means$mean_PHQ)
+cat("\nBetween-person correlation:\n")
+cat("  r =", round(between_cor$estimate, 3), "\n")
+cat(sprintf("  95%% CI [%.2f, %.2f]\n", between_cor$conf.int[1], between_cor$conf.int[2]))
+cat("  df =", between_cor$parameter, "\n")
+cat("  p =", round(between_cor$p.value, 3), "\n")
+cat(sprintf("  For manuscript: r(%d) = %.2f, 95%% CI [%.2f, %.2f], p = %.2f\n",
+            between_cor$parameter, between_cor$estimate,
+            between_cor$conf.int[1], between_cor$conf.int[2], between_cor$p.value))
+```

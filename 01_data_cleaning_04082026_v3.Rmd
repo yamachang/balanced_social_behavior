@@ -1,0 +1,1690 @@
+---
+title: "balanced_social_behavior_data_manipulation"
+author: "Yama Chang"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+geometry: margin=0.50in
+---
+
+# ============================================================================================= #
+# ============================================================================================= #
+# Tracking Depression Project
+# Balancing Real-Life and Virtual Interactions: How Social Behavior Predicts Depressive Symptoms
+# ============================================================================================= #
+# ============================================================================================= #
+
+
+# Set up
+
+```{r setup, include=FALSE, cache = FALSE}
+require("knitr")
+getwd() # Check where's your working directory
+## setting working directory if not using git
+## setwd("") # Remove hashtag at the beginning and add your working directory inside ""
+knitr::opts_chunk$set(echo = TRUE, tidy = FALSE, warning = FALSE, message = FALSE, include = TRUE, cache = FALSE)
+```
+
+```{r load packages, include=FALSE}
+
+if(!require(car)){install.packages('car')}
+library(car)
+if(!require(psych)){install.packages('psych')}
+library(psych)
+if(!require(effects)){install.packages('effects')}
+library(effects)
+if(!require(tidyverse)){install.packages('tidyverse')}
+library(tidyverse)
+if(!require(summarytools)){install.packages('summarytools')}
+library(summarytools)
+if(!require(diffdf)){install.packages('diffdf')}
+library(diffdf)
+if(!require(janitor)){install.packages('janitor')}
+library(janitor)
+if(!require(haven)){install.packages('haven')}
+library(haven)
+if(!require(lavaan)){install.packages('lavaan')}
+library(lavaan)
+if(!require(readxl)){install.packages('readxl')}
+library(readxl)
+if(!require(lubridate)){install.packages('lubridate')}
+library(lubridate)
+if(!require(mice)){install.packages('mice')}
+library(mice)
+if(!require(here)){install.packages('here')}
+library(here)
+
+```
+
+```{r parameters}
+# ---- Parameters ----
+STUDY_DAYS <- 90
+IMPUTATION_M <- 5
+IMPUTATION_SEED <- 333
+SOCIAL_APP_TIMEOUT_SEC <- 5 * 60  # 5-minute timeout for app duration calculation
+APP_TIMEZONE <- "UTC"
+```
+
+# Data Cleaning
+
+[V] Outcome variable: EMA data (PHQ9)
+[V] Online social interaction
+  - [V] calllog: `uid`, `date`, `total_duration`
+  - [V] smslog: 
+  - [V] appusage
+    - [V] running_app_123
+    - [V] unlocked
+[V] In-Person social interaction
+  - [V] audio_conversation (ALL pts): `uid`, `date`, `total_convo_length_sec`, `total_convo_length_min`
+  - [X] audio_inference (ALL pts)
+
+## EMA data
+```{r}
+# Load data with 300 TD participants
+data_ema <- read_csv(here::here("data", "3._TD_cohort_EMA_FINAL.csv")) %>%
+  janitor::clean_names() # convert column names to lower snake case
+
+# Create a ID list for these 300 pts
+IDlist <- unique(data_ema$mlife_id)
+
+data_ema_single_check <- data_ema %>% filter(mlife_id == "REDACTED_ID_1@example")
+```
+
+I need to fix the total score of PHQ-9 by:
+
+1) Missingness imputation before calculating the "total score".
+2) Get the mean (OR total?) of the daily PHD-9 score.
+3) Substitute the final PHQ-9 in the final df with this new column.
+4) Rerun the analysis.
+
+### Calculating daily PHQ-9
+```{r}
+
+# Select columns for this anlaysis
+data_ema_1 <- data_ema %>% select(uid = mlife_id, date = date_rep, ema_time, ema_timestamp, matches("phq"))
+
+# Transform date format
+data_ema_1$date <- as.Date(data_ema_1$date, format = "%m/%d/%Y")
+
+```
+
+If the time span between the first and last date for a participant is 90 days or more, keep only those consecutive dates.
+
+If the time span is less than 90 days, extend the sequence to exactly 90 days from the first available date.
+
+```{r bin dates for EMA data}
+
+# Step 1: Let's check what we're working with
+check_dates <- data_ema_1 %>%
+  group_by(uid) %>%
+  summarise(
+    first_date = min(date, na.rm = TRUE),
+    last_date = max(date, na.rm = TRUE)
+  )
+
+# Print to see what we're working with
+print(check_dates)
+
+# Step 2: Create the complete sequence
+data_ema_2 <- data_ema_1 %>%
+  # First get a single row per participant with date range info
+  group_by(uid) %>%
+  summarise(
+    first_date = min(date, na.rm = TRUE),
+    last_date = max(date, na.rm = TRUE)
+  ) %>%
+  # Calculate timespan and determine end date
+  mutate(
+    time_span = as.numeric(difftime(last_date, first_date, units = "days")),
+    end_date = if_else(
+      time_span >= 90,
+      last_date,
+      first_date + lubridate::days(89)
+    )
+  ) %>%
+  # Now create the sequence for each participant
+  rowwise() %>%  
+  mutate(
+    date_seq = list(seq.Date(
+      from = first_date,
+      to = end_date,
+      by = "day"
+    ))
+  ) %>%
+  unnest(date_seq) %>%
+  # Add bin_dates column that counts days from start (1-based)
+  group_by(uid) %>%
+  mutate(
+    bin_dates = row_number()  # This will number days sequentially starting from 1
+  ) %>%
+  ungroup() %>%
+  select(uid, date = date_seq, bin_dates, first_date, end_date) %>%
+  # Join back with original data
+  left_join(data_ema_1, by = c("uid", "date"))
+
+# Step 1: Let's check what we're working with
+check_dates <- data_ema_2 %>%
+  group_by(uid) %>%
+  summarise(
+    min_date = min(bin_dates, na.rm = TRUE),
+    max_date = max(bin_dates, na.rm = TRUE)
+  )
+
+# Print to see what we're working with
+print(check_dates)
+```
+
+
+```{r ema data imputation}
+# Perform multiple imputation
+ema_method <- make.method(data_ema_2)
+ema_method[] <- ""
+ema_method[paste0("phq_", 1:9)] <- "pmm"
+
+ema_pred <- make.predictorMatrix(data_ema_2)
+ema_pred[,] <- 0
+ema_pred[paste0("phq_", 1:9), c("bin_dates", paste0("phq_", 1:9))] <- 1
+diag(ema_pred) <- 0
+
+mice_ema <- mice(
+  data_ema_2,
+  m = IMPUTATION_M,
+  method = ema_method,
+  predictorMatrix = ema_pred,
+  remove.collinear = FALSE,
+  seed = IMPUTATION_SEED
+) # For reproducibility
+
+# Extract the first imputed dataset
+data_ema_3 <- complete(mice_ema, 1)
+
+# Keep the first 90 days
+data_ema_4 <- data_ema_3 %>% filter(bin_dates %in% 1:STUDY_DAYS)
+
+sum(is.na(data_ema_4$phq_1)) # check NA after imputation
+```
+
+
+```{r}
+# Total PHQ-9
+data_ema_5 <- data_ema_4 %>%
+  mutate(phq_total = rowSums(select(., paste0("phq_", 1:9)), na.rm = TRUE),
+         phq_mean = rowMeans(select(., paste0("phq_", 1:9)), na.rm = TRUE))
+
+# Daily PHQ-9
+data_ema_6 <- data_ema_5 %>%
+  group_by(uid, date) %>%
+  summarize(
+    daily_phq_total = mean(phq_total, na.rm = TRUE),
+    daily_phq_mean = mean(phq_mean, na.rm = TRUE),
+    bin_dates = first(bin_dates),
+    .groups = "drop"
+  )
+
+# Export as csv
+```
+
+## Sensing data 
+```{r read data, include=FALSE}
+# Note: complete_feat_dataset.csv and app_usage_feat.csv were earlier
+# pre-processed feature files used for exploratory inspection. The pipeline
+# below reads each data stream from its original source file (calllog.csv,
+# df_convo_3_02202025.csv, df_running_app_combined.csv, etc.), so this
+# chunk is no longer needed.
+```
+
+### Battery data
+
+```{r}
+# List all CSV files in the "convo" folder
+file_paths <- list.files(path = here::here("data", "battery"), pattern = "*.csv", full.names = TRUE)
+
+df_battery <- file_paths %>%
+  map_dfr(~ read_csv(.x) %>%
+            clean_names() %>%
+            mutate(across(everything(), as.character))) 
+
+df_battery_1 <- df_battery %>% 
+  select(uid, day, no = x1, battery = data) %>% 
+  mutate(
+    date = as.Date(day),               # Extract the date (yyyy-mm-dd)
+    hour = hour(ymd_hms(day))          # Extract the hour of the day
+  ) %>%
+  distinct(uid, date, hour, .keep_all = TRUE)  # Make sure unique rows per date and hour
+
+# Create a complete grid for each `uid`, `date`, and `hour`
+df_battery_complete <- df_battery_1 %>%
+  # First get clean date ranges for each uid
+  group_by(uid) %>%
+  summarise(
+    min_date = min(date, na.rm = TRUE),
+    max_date = max(date, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Create nested dataframe with date sequences
+  rowwise() %>%
+  mutate(date = list(seq(min_date, max_date, by = "day"))) %>%
+  unnest(date) %>%
+  # Join back with original data
+  left_join(df_battery_1, by = c("uid", "date")) %>%
+  # Now complete the hours
+  group_by(uid, date) %>%
+  complete(
+    hour = 0:23,
+    fill = list(no = NA, battery = NA, day = NA)
+  ) %>%
+  select(-min_date, -max_date) %>%
+  ungroup()
+
+# df_battery_complete <- df_battery_1 %>%
+#   group_by(uid, date) %>%
+#   complete(
+#     hour = 0:23, # Ensure all 24 hours are included
+#     fill = list(no = NA, battery = NA) # Fill missing combinations with NA
+#   ) %>%
+#   ungroup()
+test_battery1 <- df_battery %>% filter(uid == "REDACTED_ID_1@example")
+
+df_battery_complete <- df_battery_complete %>%
+  mutate(
+    running = ifelse(is.na(battery), 0, 1) # Code as 0 for NA and 1 for non-NA
+  )
+
+# Aggregate data to day-level and create `running_day`
+df_battery_day_level <- df_battery_complete %>%
+  group_by(uid, date) %>%
+  summarize(
+    running_day = ifelse(any(running == 1, na.rm = TRUE), 1, 0), # Check if at least one `running == 1`
+    .groups = "drop"
+  )
+
+# Check for missing dates and bin the data
+df_battery_day_level_1 <- df_battery_day_level %>%
+  group_by(uid) %>%
+  # Create a complete sequence of dates for each participant
+  complete(date = seq(min(date), max(date), by = "1 day")) %>%
+  # Add a "bin" column for days starting from the earliest date
+  mutate(bin = as.numeric(difftime(date, min(date), units = "days")) + 1) %>% 
+  ungroup()
+
+# Count NA values in the `running_day` column
+sum(is.na(df_battery_day_level_1$running_day))
+
+
+# Check for missing days in the sequence 1 to 90 for each participant
+df_battery_day_level_1 %>%
+  group_by(uid) %>%
+  summarize(
+    missing_days = list(setdiff(1:90, bin)), # Compare expected vs actual sequence
+    total_missing = length(setdiff(1:90, bin)) # Count missing days
+  ) %>%
+  filter(total_missing > 0) # Keep only participants with missing days
+
+```
+
+```{r}
+# check for duplicates in the Battery data per date & hour combination:
+duplicates_detail <- df_battery_complete %>%
+  group_by(uid, date, hour) %>%
+  filter(n() > 1) %>%
+  arrange(uid, date, hour)
+
+duplicates_detail
+```
+
+```{r}
+# Identify participants with missing hours
+missing_hours_summary <- df_battery_complete %>%
+  filter(is.na(battery)) %>%
+  group_by(uid, date) %>%
+  summarize(missing_hours = n(), .groups = "drop")
+
+print(missing_hours_summary)
+
+```
+
+
+
+
+### Call Log
+
+Total time of call duration.
+
+Q: `type` data has more than 7 categories. Select only `1. Incoming`, `2. Outgoing`, and `7: Answered externally`
+
+1: Incoming; 2: Outgoing; 3: Missed; 4: Voicemail; 5: Rejected; 6: Blocked; 7: Answered externally (Call log type for a call which was answered on another device. Used in situations where a call rings on multiple devices simultaneously and it ended up being answered on a device other than the current one.)
+
+```{r}
+df_calllog <- read_csv(here::here("data", "calllog.csv")) %>%
+  janitor::clean_names() # convert column names to lower snake case
+
+colnames(df_calllog)
+
+# Select columns that'd be helpful for this analysis
+df_calllog_1 <- df_calllog %>% select(uid, duration:type) 
+```
+```{r}
+# Step 1: Get clean date ranges from data_ema_6 (one row per uid)
+date_ranges <- data_ema_6 %>%
+  group_by(uid) %>%
+  summarise(first_date = min(date), end_date = max(date), .groups = "drop")
+
+# Step 2: Process initial call log data
+df_calllog_base <- df_calllog_1 %>% 
+  mutate(
+    date = as.Date(time),
+    hour = hour(ymd_hms(time)),
+    hour = ifelse(is.na(hour), 0, hour)
+  )
+
+# Step 3: Create template with all combinations and bin_dates
+template <- date_ranges %>%
+  rowwise() %>%
+  mutate(
+    dates = list(seq(first_date, end_date, by = "day"))
+  ) %>%
+  unnest(dates) %>%
+  group_by(uid) %>%
+  mutate(
+    bin_dates = row_number()  # Add bin_dates
+  ) %>%
+  filter(bin_dates <= 90) %>%  # Keep only first 90 days
+  crossing(hour = 0:23) %>%
+  select(uid, date = dates, hour, bin_dates)
+
+# Step 4: Join template with call data
+df_calllog_1_complete <- template %>%
+  left_join(
+    df_calllog_base,
+    by = c("uid", "date", "hour")
+  ) %>%
+  arrange(uid, date, hour)
+
+# Verify the results
+verification <- df_calllog_1_complete %>%
+  group_by(uid) %>%
+  summarise(
+    n_dates = n_distinct(date),
+    n_hours = n() / n_distinct(date),
+    .groups = "drop"
+  )
+
+print(head(verification))  # Should now show exactly 90 dates for all UIDs
+```
+
+```{r}
+# `df_battery_complete` `df_calllog_1_complete`
+# Check missing battery data and update call duration totals
+df_calllog_1_battery <- df_calllog_1_complete %>%
+  # Join with battery data to check if battery is missing
+  left_join(df_battery_complete, by = c("uid", "date", "hour")) %>%
+  # Create the `isbatterymissing` column: TRUE if no matching battery data
+  mutate(battery_running = ifelse(is.na(battery), 0, 1)) %>%
+  # Update `duration_new` to 0 if:
+  # - Battery is running, AND
+  # - `duration` is NA
+  mutate(
+    duration_new = ifelse(battery_running == 1 & is.na(duration), 0, duration)
+                          #ifelse(battery_running == 0 & !is.na(duration), NA, duration))
+  ) %>% 
+  select(uid, date, hour, bin_dates, duration_new, time, type, battery_running)
+
+# Verify the results
+verification <- df_calllog_1_battery %>%
+  group_by(uid) %>%
+  summarise(
+    n_dates = n_distinct(date),
+    n_hours = n() / n_distinct(date),
+    .groups = "drop"
+  )
+
+# table(df_calllog_1_battery$duration_new)
+# sum(is.na(df_calllog_1_battery$duration_new)) # original
+# sum(is.na(df_calllog_1_battery$duration_new)) # new
+# nrow(df_calllog_1_battery)
+
+# Check the duration when battery's off: we might have call log data for longer than the study period while batter data is just the study period
+df_calllog_1_batteryoff <- df_calllog_1_battery %>% filter(battery_running == 0)
+table(df_calllog_1_batteryoff$duration_new)
+
+# type data has weird value: it's less than 100 values - we can safely transform to NA
+table(df_calllog_1_battery$type)
+
+# Clean type data
+df_calllog_1_battery_1 <- df_calllog_1_battery %>% 
+  # Recode values other than 1 to 7 to NA
+  mutate(type = ifelse(type %in% c(1, 2, 3, 4, 5, 6, 7), type, NA))
+
+table(df_calllog_1_battery_1$type) # check!
+```
+
+#### Multiple imputation (Call log)
+```{r Multiple imputation - call log}
+# Fix: For missing dates with other types of calls: 0 secs - don’t impute
+# sum(is.na(df_calllog_1_battery_1$duration_new)) check how may NAs
+
+df_calllog_1_battery_2 <- df_calllog_1_battery_1 %>% 
+  mutate(duration_new = ifelse(type %in% c(3, 4, 5, 6), 0, duration_new))
+
+# maintain the complete date structure (all dates for each UID) even after filtering for specific types (1, 2, 7)
+# First create a complete date frame from UNFILTERED data
+complete_frame <- df_calllog_1_battery_2 %>%  # using original unfiltered data
+  distinct(uid, date) %>%
+  group_by(uid) %>%
+  complete(date = seq(min(date), max(date), by = "1 day"))
+
+# Then join with your filtered data
+df_calllog_1_battery_3 <- df_calllog_1_battery_2 %>%
+  filter(type %in% c(1, 2, 7)) %>%
+  right_join(complete_frame, by = c("uid", "date")) %>% 
+  arrange(uid, date)
+
+df_filtered <- df_calllog_1_battery_3 %>%
+  mutate(
+    period = case_when(
+      hour >= 0 & hour < 8  ~ "Night",
+      hour >= 8 & hour < 12 ~ "Morning",
+      hour >= 12 & hour < 18 ~ "Afternoon",
+      hour >= 18 & hour < 24 ~ "Evening"
+    ) # Time-Series Segmentation: Categorizing Time Into Four Periods
+  ) %>% 
+  select(uid, date, bin_dates, period, duration_new, type) # substitute hour by period
+
+# test4 <- df_calllog_total %>% filter(uid == "REDACTED_ID_1@example")
+
+# Perform multiple imputation
+calllog_method <- make.method(df_filtered)
+calllog_method[] <- ""
+calllog_method["duration_new"] <- "pmm"
+
+calllog_pred <- make.predictorMatrix(df_filtered)
+calllog_pred[,] <- 0
+calllog_pred["duration_new", c("bin_dates", "period", "type")] <- 1
+
+mice_calllog <- mice(
+  df_filtered,
+  m = IMPUTATION_M,
+  method = calllog_method,
+  predictorMatrix = calllog_pred,
+  remove.collinear = FALSE,
+  seed = IMPUTATION_SEED
+)
+
+# Extract the first imputed dataset
+completed_data <- complete(mice_calllog, 1)
+
+# Calculate/Aggregate sum duration
+df_calllog_total <- completed_data %>%
+  group_by(uid, date) %>%
+  summarize(
+    total_call_duration = sum(duration_new, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  filter(uid %in% IDlist)
+
+# Verify the results
+verification <- df_calllog_total %>%
+  group_by(uid) %>%
+  summarise(
+    n_dates = n_distinct(date),
+    n_hours = n() / n_distinct(date),
+    .groups = "drop"
+  )
+table(verification$n_dates)
+
+```
+
+### Audio conversation
+
+Total time spent on verbal conversations based on audio data to quantify in-person engagement.
+
+```{r convo processing note}
+# Note: Raw conversation processing is done in earlier scripts. We load the pre-processed conversation data below.
+```
+
+```{r fun expand_conversation_to_hours}
+expand_conversation_to_hours <- function(start_time, end_time) {
+  # Convert to POSIXct with explicit timezone
+  start_time <- as.POSIXct(start_time, tz = "America/New_York")
+  end_time <- as.POSIXct(end_time, tz = "America/New_York")
+  
+  # Calculate floor and ceiling times
+  start_floor <- floor_date(start_time, "hour")
+  end_ceiling <- ceiling_date(end_time, "hour")
+  
+  # Calculate hours as numeric differences to handle DST transition
+  hours_seq <- seq(
+    as.numeric(start_floor), 
+    as.numeric(end_ceiling) - 3600, # subtract one hour in seconds
+    by = 3600  # one hour in seconds
+  )
+  
+  # Convert back to POSIXct
+  as.POSIXct(hours_seq, origin = "1970-01-01", tz = "America/New_York")
+}
+```
+
+```{r}
+# Load processed df_convo_3
+df_convo_3 <- read_csv(here::here("data", "df_convo_3_02202025.csv"))
+
+# Test with one ID
+# df_convo_3temp <- df_convo_3 %>% filter(uid %in% c("REDACTED_ID_1@example", "REDACTED_ID_2@example"))
+
+# Step 1: Get clean date ranges from data_ema_6
+date_ranges <- data_ema_6 %>%
+  group_by(uid) %>%
+  summarise(first_date = min(date), end_date = max(date), .groups = "drop")
+
+# Step 2: Process conversation data with hours
+df_convo_binned <- df_convo_3 %>%
+  rowwise() %>%
+  mutate(hours_spanned = list(expand_conversation_to_hours(start_time, end_time))) %>%
+  unnest(hours_spanned) %>%
+  mutate(
+    date = as.Date(hours_spanned),
+    hour = hour(hours_spanned)
+  )
+
+# Step 3: Create template with correct date ranges and bin_dates
+template <- date_ranges %>%
+  rowwise() %>%
+  mutate(
+    dates = list(seq(first_date, end_date, by = "day"))
+  ) %>%
+  unnest(dates) %>%
+  group_by(uid) %>%
+  mutate(
+    bin_dates = row_number()
+  ) %>%
+  filter(bin_dates <= 90) %>%  # Keep only first 90 days
+  crossing(hour = 0:23) %>%
+  select(uid, date = dates, hour, bin_dates)
+
+# Step 4: Join template with conversation data
+df_convo_complete <- template %>%
+  left_join(
+    df_convo_binned,
+    by = c("uid", "date", "hour")
+  ) %>%
+  group_by(uid) %>%
+  mutate(
+    convo_recorded = if_else(!is.na(convo_length_sec), 1, 0),
+    x1 = if_else(is.na(x1), first(x1[!is.na(x1)]), x1),
+    start_time = if_else(!is.na(convo_length_sec), start_time, NA),
+    end_time = if_else(!is.na(convo_length_sec), end_time, NA),
+    convo_length_sec = if_else(is.na(convo_length_sec), NA, convo_length_sec),
+    convo_length_min = if_else(is.na(convo_length_min), NA, convo_length_min)
+  ) %>%
+  ungroup()
+
+# Step 5: Combine with battery data
+df_combined <- df_convo_complete %>%
+  left_join(df_battery_complete, by = c("uid", "date", "hour")) %>%
+  mutate(convo_recorded = ifelse(convo_recorded == 0 | is.na(convo_recorded), 0, 1)) 
+
+# Step 6: Classify hours as before
+df_combined_1 <- df_combined %>%
+  mutate(
+    non_event_status = case_when(
+      convo_recorded == 0 & running == 0 ~ "Real Non-Event",
+      convo_recorded == 0 & running == 1 ~ "Potential Missingness",
+      convo_recorded == 1 & running == 0 ~ "Battery down with convo data",
+      convo_recorded == 1 ~ "Conversation Recorded"
+    )) 
+
+table(df_combined_1$non_event_status)
+
+# Step 7: Recode "Potential Missingness" to 0 sec as it's not detected IRL
+df_convo_4 <- df_combined_1 %>%
+  # filter(non_event_status == "Potential Missingness") %>%
+  mutate(convo_length_sec = ifelse(non_event_status == "Potential Missingness", 0, convo_length_sec)) %>%
+  select(uid, date, hour, bin_dates, start_time, end_time, 
+         convo_length_sec, convo_length_min, convo_recorded, non_event_status) 
+
+# Verification
+verification <- df_convo_4 %>%
+  group_by(uid) %>%
+  summarise(
+    n_dates = n_distinct(date),
+    n_hours = n() / n_distinct(date)
+  )
+
+table(verification$n_dates) # 300 pts and 90 days
+```
+
+#### Multiple imputation (Conversation)
+```{r Multiple imputation - conversation}
+# Transform to 4 periods
+df_filtered <- df_convo_4 %>% 
+  mutate(
+    period = case_when(
+      hour >= 0 & hour < 8  ~ "Night",
+      hour >= 8 & hour < 12 ~ "Morning",
+      hour >= 12 & hour < 18 ~ "Afternoon",
+      hour >= 18 & hour < 24 ~ "Evening"
+    ) # Time-Series Segmentation: Categorizing Time Into Four Periods
+  ) %>% 
+  select(uid, date, bin_dates, period, convo_length_sec, non_event_status) # keep bin_dates as time predictor
+
+table(df_filtered$period, df_filtered$non_event_status)
+sum(is.na(df_filtered$convo_length_sec)) # Only convo_length_sec has missingness
+
+# Perform multiple imputation
+convo_method <- make.method(df_filtered)
+convo_method[] <- ""
+convo_method["convo_length_sec"] <- "pmm"
+
+convo_pred <- make.predictorMatrix(df_filtered)
+convo_pred[,] <- 0
+convo_pred["convo_length_sec", c("bin_dates", "period", "non_event_status")] <- 1
+
+mice_convo <- mice(
+  df_filtered,
+  m = IMPUTATION_M, # Number of imputed datasets
+  method = convo_method,
+  predictorMatrix = convo_pred,
+  remove.collinear = FALSE,
+  seed = IMPUTATION_SEED
+) # For reproducibility
+
+# Extract the first imputed dataset
+completed_data <- complete(mice_convo, 1)
+
+sum(is.na(completed_data$convo_length_sec)) # Check if there's any NA
+
+# Calculate/Aggregate sum duration
+df_convo_total <- completed_data %>%
+  group_by(uid, date) %>%
+  summarize(
+    total_convo_duration = sum(convo_length_sec, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  filter(uid %in% IDlist)
+
+```
+
+### App usage
+
+```{r app categories from Anna}
+# Read app categories data 
+app_cat <- read_csv(here::here("data", "Apps_categorization_final.csv"))
+
+# Keep any rows categorized as communication app in one of the categories
+app_cat_1 <- app_cat %>% 
+  filter(googleCats == "communication" | Schoedel == "Communication" | cats == "chat" | reducedCats == "Communication")
+
+# Refine it to be more accurate
+app_cat_2 <- app_cat %>% 
+  filter(Schoedel == "Communication" | reducedCats == "Communication") %>% 
+  filter(!cats %in% c("email", "videoconference", "other", "?")) %>% 
+  select(ID = `...1`, everything())
+
+# Re-categorize `com.viber.voip` to chat since it's a messaging and calling app
+# The Viber messenger is very popular in the Philippines, Greece, Eastern Europe, Russia, the Middle East, and some Asian markets
+app_cat_2$cats[app_cat_2$ID == 346] <- "chat"
+
+# Remove all call & dialing in `cats` column since they're all calling / dialing log
+app_cat_3 <- app_cat_2 %>% filter(!cats == "calling&contacts")
+
+# Build a regex from escaped app IDs to avoid accidental partial matches
+chat_apps_pattern <- paste(stringr::str_replace_all(app_cat_3$app_name, "([.|()\\^{}+$*?]|\\[|\\]|\\\\)", "\\\\\\1"), collapse = "|")
+
+```
+
+```{r app processing note}
+# Note: Raw app data processing is done in earlier scripts.
+```
+
+```{r app initial clean}
+
+# Load combined data
+df_running_app <- read_csv(here::here("data", "df_running_app_combined.csv")) %>%
+  select(1:4) 
+
+# Transform to full datetime format
+df_running_app$start_time <- as.POSIXct(df_running_app$day, format = "%Y-%m-%d %H:%M:%S", tz = APP_TIMEZONE)
+
+# Filter the data frame for rows between 2021-06-01 and 2024-04-30
+df_running_app <- df_running_app %>%
+  filter(start_time >= as.Date("2021-06-01") & start_time <= as.Date("2024-04-30"))
+
+# Capture social apps in chat_apps_pattern list
+df_running_app$social_app <- ifelse(
+  grepl(chat_apps_pattern, df_running_app$data),
+  1, # Mark as social app
+  0  # Not a social app
+)
+
+table(df_running_app$social_app)
+
+# Final df
+df_running_app_clean <- df_running_app %>% 
+  select(event_id = x1, uid, app_data = data, start_time, social_app) %>% 
+  filter(uid %in% IDlist)
+```
+
+```{r}
+# Identify participants with no social app usage
+no_social_app_users <- df_running_app_clean %>%
+  group_by(uid) %>%
+  summarize(all_social_app_zero = all(social_app == 0)) %>%
+  filter(all_social_app_zero) %>%
+  pull(uid)
+
+cat("Participants with no social app usage: ")
+print(no_social_app_users)
+```
+
+```{r}
+# Step 1: Get clean date ranges from data_ema_6
+date_ranges <- data_ema_6 %>%
+  group_by(uid) %>%
+  summarise(first_date = min(date), end_date = max(date), .groups = "drop")
+
+# Step 2: Process app data with initial time binning
+df_app_binned <- df_running_app_clean %>%
+  mutate(
+    start_time = as.POSIXct(start_time, tz = APP_TIMEZONE),
+    date = as.Date(start_time),
+    hour = hour(start_time),
+    app_usage = 1
+  )
+
+# Step 3: Create template with correct date ranges and bin_dates
+template <- date_ranges %>%
+  rowwise() %>%
+  mutate(
+    dates = list(seq(first_date, end_date, by = "day"))
+  ) %>%
+  unnest(dates) %>%
+  group_by(uid) %>%
+  mutate(
+    bin_dates = row_number()
+  ) %>%
+  filter(bin_dates <= 90) %>%  # Keep only first 90 days
+  crossing(hour = 0:23) %>%
+  select(uid, date = dates, hour, bin_dates)
+
+# Step 4: Combine with battery data and app usage
+df_app_complete <- template %>%
+  left_join(df_battery_complete, by = c("uid", "date", "hour")) %>%
+  left_join(df_app_binned, by = c("uid", "date", "hour")) %>%
+  mutate(
+    # Real non-event = battery off AND no app usage
+    real_non_event = as.integer(running == 0 & is.na(app_usage)),
+    # Fill NA app_usage with 0 where appropriate
+    app_usage = ifelse(is.na(app_usage), 0, app_usage)
+  )
+
+table(df_app_complete$real_non_event)
+
+# Step 4-1: create a df with only non-events
+df_app_non_events <- df_app_complete %>% 
+  filter(real_non_event == 1) %>% 
+  select(uid, date, hour, bin_dates, real_non_event)
+
+# Verification
+verification <- df_app_complete %>%
+  group_by(uid) %>%
+  summarise(
+    n_dates = n_distinct(date),
+    n_hours = n() / n_distinct(date),
+    total_app_usage = sum(app_usage),
+    n_real_non_events = sum(real_non_event)
+  )
+
+table(verification$n_dates)
+
+# Check for any remaining NA in key columns
+na_check <- df_app_complete %>%
+  summarise(
+    na_date = sum(is.na(date)),
+    na_hour = sum(is.na(hour)),
+    na_bin_dates = sum(is.na(bin_dates)),
+    na_running = sum(is.na(running)),
+    na_app_usage = sum(is.na(app_usage))
+  )
+
+print(na_check)
+```
+
+
+### Missingness imputation for app usage data
+Note: Earlier app binning and non-event handling code has been consolidated into the sections above.
+
+### Unlock data
+
+```{r load unlock data, cache=FALSE}
+# Load unlock data clean (raw processing done in earlier scripts)
+load(here::here("results", "df_unlock_clean.RData"))
+```
+
+```{r}
+df_unlock_clean <- df_unlock_clean %>% filter(uid %in% IDlist)
+```
+
+```{r}
+# Some pts have less than 90 days of lock/unlock data
+# Check the number of days per user
+user_days <- df_unlock_clean %>%
+  group_by(uid) %>%
+  summarise(days = n_distinct(date))
+
+# Find users with fewer than 90 days of data
+missing_days_users <- user_days %>% filter(days < 90)
+print(missing_days_users)
+```
+
+### Time Duration using Social App
+
+#### Duration Calculation Algorithm
+```{r}
+# Filter for only social app events
+# social_app_events <- df_running_app_clean %>%
+#   #filter(social_app == 1) %>%
+#   arrange(uid, start_time)
+
+# Filter for only social app events using binned df
+social_app_events <- df_app_complete %>%
+  filter(social_app == 1) %>%
+  arrange(uid, start_time)
+
+# social_non_event <- social_app_events %>% filter(social_app_events$real_non_event == 1)
+# 
+# # Create datetime
+# social_non_event_1 <- social_non_event %>%
+#   mutate(
+#     day = as.POSIXct(
+#       paste(date, sprintf("%02d:00:00.00", hour)),
+#       format = "%Y-%m-%d %H:%M:%OS",
+#       tz = "America/New_York"  # or your preferred timezone
+#     )
+#   ) %>% 
+#   select(1:4, 13)
+
+
+# Define the timeout duration (5 minutes)
+timeout_seconds <- SOCIAL_APP_TIMEOUT_SEC
+
+# Function to calculate durations for each social app event
+calculate_durations <- function(event_start_time, unlock_data, next_event_time) {
+  # Convert unlock_data to a data frame of seconds and lock/unlock status
+  unlock_df <- data.frame(
+    timestamp = seq(
+    as.POSIXct(paste(as.Date(event_start_time), "00:00:00"), tz = APP_TIMEZONE),
+    by = "1 sec",
+    length.out = length(unlock_data)
+  ),
+    is_unlocked = unlock_data
+  )
+  
+  # Filter data for relevant seconds
+  relevant_data <- unlock_df %>% filter(timestamp >= floor_date(event_start_time, "second")) # rounding event_start_time to the nearest second
+  
+  # Condition 1: Any new app opened
+  if (length(next_event_time) == 0 || is.na(next_event_time)) {
+    condition1_duration <- Inf
+  } else {
+    condition1_duration <- as.numeric(difftime(next_event_time, event_start_time, units = "secs"))
+  }
+  
+  # Condition 2: Phone locked
+  condition2_time <- relevant_data %>%
+    filter(is_unlocked == 0) %>% # lock: 0, unlock: 1
+    slice(1) %>%
+    pull(timestamp)
+  
+  # Handle case where no phone lock occurs
+  condition2_duration <- if (length(condition2_time) == 0) {
+    Inf # use Inf as we will find the minimum value later
+  } else {
+    as.numeric(difftime(condition2_time, event_start_time, units = "secs"))
+  }
+  
+  # Condition 3: Timeout (5 minutes)
+  condition3_duration <- timeout_seconds
+  
+  # Calculate the minimum duration
+  min_duration <- min(condition1_duration, condition2_duration, condition3_duration)
+  
+  return(data.frame(
+    condition1_duration = condition1_duration,
+    condition2_duration = condition2_duration,
+    condition3_duration = condition3_duration,
+    min_duration = min_duration
+  ))
+}
+```
+
+#### Test in a small batch of pts
+```{r social app + text - small batch of pts}
+# small dataset to test
+test_id <- IDlist[1:2]
+# Process each user's social app events
+results <- list()
+
+# Loop through each unique user ID
+for (id in test_id) {
+  
+  # Filter data for this user
+  user_social_events <- social_app_events %>% filter(uid == id)
+  user_all_events <- df_running_app_clean %>% filter(uid == id) %>% arrange(start_time)
+  user_unlock <- df_unlock_clean %>% filter(uid == id)
+  
+  # Skip if no social events are available for the user
+  if (nrow(user_social_events) == 0) {
+    next
+  }
+  
+  # Skip if no unlock data is available for the user
+  if (nrow(user_unlock) == 0) {
+    next
+  }
+  
+  # Loop through each social app event for this user
+  for (i in 1:nrow(user_social_events)) {
+    
+    # Get social app event details
+    event_start_time <- user_social_events$start_time[i]
+    
+    # Extract the date from the event_start_time
+    event_date <- as.Date(event_start_time)
+    
+    # Skip if event_date is NA or not in user_unlock$date
+    if (is.na(event_date) || nrow(user_unlock) == 0 || !event_date %in% user_unlock$date) {
+      next
+    }
+    
+    # Find the unlock data corresponding to the event's date
+    # if (!event_date %in% user_unlock$date) {
+    #   # Skip if the event_date is not in the user's unlock data
+    #   next
+    # }
+    
+    # Skip if the event_date is not in user_unlock$date
+    # if (!event_date %in% user_unlock$date) {
+    #   next
+    # }
+    
+    # Extract and unlist the unlock data for the event's date
+    unlock_data <- user_unlock %>%
+      filter(date == event_date) %>%
+      pull(data) %>%
+      unlist()
+    
+    # Skip if no unlock data is available for the date
+    if (length(unlock_data) == 0) {
+      next
+    }
+    
+    # Get the next event start time (ANY app, including non-social apps)
+    next_event_time <- user_all_events %>%
+      filter(start_time > event_start_time) %>%
+      slice(1) %>%
+      pull(start_time)
+    
+    # Handle case where there is no next event
+    if (length(next_event_time) == 0) {
+      next_event_time <- NA
+    }
+    
+    # Calculate durations for this event
+    durations <- calculate_durations(event_start_time, unlock_data, next_event_time)
+    durations$uid <- id
+    durations$event_id <- user_social_events$event_id[i]
+    durations$date <- event_date               # Add the date column
+    durations$event_start_time <- event_start_time  # Add event_start_time column
+    
+    # Append to results
+    results[[length(results) + 1]] <- durations
+  }
+}
+
+# Combine all results from a list of data frames into a single data frame
+results_df1 <- do.call(rbind, results)
+
+# Reorder df
+results_df2 <- results_df1 %>% select(uid, event_id, date, event_start_time, everything())
+
+# Calculate total duration each day per participant
+results_df3 <- results_df2 %>% 
+  group_by(uid, date) %>% 
+  summarise(total_duration = sum(min_duration)) # If `total_duration` is negative value, it should equal to 0 (all the negative value is smaller than 1 sec)
+```
+
+#### All pts
+
+```{r social app + text - all pts}
+# Process each user's social app events
+results <- list()
+
+# Loop through each unique user ID
+for (id in IDlist) {
+  
+  # Filter data for this user
+  user_social_events <- social_app_events %>% filter(uid == id)
+  user_all_events <- df_running_app_clean %>% filter(uid == id) %>% arrange(start_time)
+  user_unlock <- df_unlock_clean %>% filter(uid == id)
+  
+  # Skip if no social events are available for the user
+  if (nrow(user_social_events) == 0) {
+    next
+  }
+  
+  # Skip if no unlock data is available for the user
+  if (nrow(user_unlock) == 0) {
+    next
+  }
+  
+  # Loop through each social app event for this user
+  for (i in 1:nrow(user_social_events)) {
+    
+    real_non_event <- user_social_events$real_non_event[i]
+    # Get social app event details
+    event_start_time <- user_social_events$start_time[i]
+    
+    # Extract the date from the event_start_time
+    event_date <- as.Date(event_start_time)
+    
+    # Skip if event_date is NA or not in user_unlock$date
+    if (is.na(event_date) || nrow(user_unlock) == 0 || !event_date %in% user_unlock$date) {
+      next
+    }
+    
+    # Extract and unlist the unlock data for the event's date
+    unlock_data <- user_unlock %>%
+      filter(date == event_date) %>%
+      pull(data) %>%
+      unlist()
+
+    # Skip if no unlock data is available for the date
+    if (length(unlock_data) == 0) {
+      next
+    }
+
+    # Get the next event start time (ANY app, including non-social apps)
+    next_event_time <- user_all_events %>%
+      filter(start_time > event_start_time) %>%
+      slice(1) %>%
+      pull(start_time)
+
+    # Handle case where there is no next event
+    if (length(next_event_time) == 0) {
+      next_event_time <- NA
+    }
+
+    # Calculate durations for this event
+    durations <- calculate_durations(event_start_time, unlock_data, next_event_time)
+    durations$uid <- id
+    durations$event_id <- user_social_events$event_id[i]
+    durations$date <- event_date               # Add the date column
+    durations$event_start_time <- event_start_time  # Add event_start_time column
+
+    # Append to results
+    results[[length(results) + 1]] <- durations
+  }
+}
+
+# Combine all results into a single data frame
+results_all <- do.call(rbind, results)
+
+# Reorder data frame columns
+results_all <- results_all %>%
+  select(uid, event_id, date, event_start_time, everything())
+
+```
+
+
+```{r}
+results_all <- read_csv(here::here("data", "result_app_duration_all.csv"))
+
+results_all_1 <- results_all %>% 
+  mutate(hour = hour(event_start_time)) %>% 
+  select(uid, date, hour, condition1_duration, condition2_duration, condition3_duration)
+ 
+df_app_non_events_1 <- df_app_non_events %>% 
+  mutate(
+    condition1_duration = NA, 
+    condition2_duration = NA, 
+    condition3_duration = 300
+  ) %>% 
+  select(-bin_dates, -real_non_event)
+
+results_all_2 <- rbind(results_all_1, df_app_non_events_1)
+
+# Check for duplicates specifically when both duration conditions are NA:
+results_all_2 %>% 
+  filter(is.na(condition1_duration) & is.na(condition2_duration)) %>%
+  group_by(uid, date, hour) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  filter(n > 1)
+
+
+
+# results_all_2 <- results_all_1 %>% 
+#   left_join(social_non_event_1, by = c("uid", "date", "hour")) %>% 
+#   select(1:10, 19) %>% 
+#   arrange(uid, date, hour)
+
+
+```
+
+```{r}
+df_filtered_nonevent <- df_app_non_events_1 %>% 
+  # filter(type %in% c("1", "2", "7")) %>% 
+  mutate(
+    period = case_when(
+      hour >= 0 & hour < 8  ~ "Night",
+      hour >= 8 & hour < 12 ~ "Morning",
+      hour >= 12 & hour < 18 ~ "Afternoon",
+      hour >= 18 & hour < 24 ~ "Evening"
+    ) # Time-Series Segmentation: Categorizing Time Into Four Periods
+  ) %>% 
+  select(uid, date, hour, period, condition1_duration, condition2_duration, condition3_duration) # substitute hour by period
+
+```
+
+```{r}
+
+df_filtered <- results_all_2 %>% 
+  # filter(type %in% c("1", "2", "7")) %>% 
+  mutate(
+    period = case_when(
+      hour >= 0 & hour < 8  ~ "Night",
+      hour >= 8 & hour < 12 ~ "Morning",
+      hour >= 12 & hour < 18 ~ "Afternoon",
+      hour >= 18 & hour < 24 ~ "Evening"
+    ) # Time-Series Segmentation: Categorizing Time Into Four Periods
+  ) %>% 
+  mutate(
+    condition1_duration = ifelse(is.infinite(condition1_duration), NA, 
+                                 ifelse(condition1_duration < 0, 0, condition1_duration)),
+    condition2_duration = ifelse(is.infinite(condition2_duration), NA, 
+                                 ifelse(condition2_duration < 0, 0, condition2_duration)),
+    condition3_duration = ifelse(is.infinite(condition3_duration), NA, 
+                                 ifelse(condition3_duration < 0, 0, condition3_duration))
+  ) %>% 
+  select(uid, date, hour, period, condition1_duration, condition2_duration, condition3_duration) # substitute hour by period
+
+# Check initial data
+print("Initial NA counts:")
+print(colSums(is.na(df_filtered)))
+
+# Check for Inf and negative values
+colSums(sapply(df_filtered[, c("condition1_duration", "condition2_duration", "condition3_duration")], is.infinite))
+
+# Run mice() on all three duration candidates with explicit predictors
+app_method <- make.method(df_filtered)
+app_method[] <- ""
+app_method[c("condition1_duration", "condition2_duration", "condition3_duration")] <- "pmm"
+
+app_pred <- make.predictorMatrix(df_filtered)
+app_pred[,] <- 0
+app_pred[c("condition1_duration", "condition2_duration", "condition3_duration"),
+         c("hour", "period", "condition1_duration", "condition2_duration", "condition3_duration")] <- 1
+diag(app_pred) <- 0
+
+mice_app <- mice(
+  df_filtered,
+  method = app_method,
+  predictorMatrix = app_pred,
+  remove.collinear = FALSE,
+  m = IMPUTATION_M,
+  maxit = 50,
+  seed = IMPUTATION_SEED
+)
+
+# Extract the completed data
+completed_data <- complete(mice_app, 1)
+
+# Check final data
+print("Final NA counts:")
+print(colSums(is.na(completed_data)))
+
+```
+```{r}
+# Calculate/Aggregate sum duration
+df_app_min <- completed_data %>%
+  mutate(min_duration = pmin(condition1_duration, condition2_duration, condition3_duration, na.rm = T)) 
+
+df_app_total <- df_app_min %>% 
+  group_by(uid, date) %>%
+  summarise(total_duration = sum(min_duration, na.rm = TRUE)) %>% 
+  filter(uid %in% IDlist)
+
+```
+
+```{r}
+# Step 1: Get date ranges from data_ema_6
+date_ranges <- data_ema_6 %>%
+  group_by(uid) %>%
+  summarise(first_date = min(date), end_date = max(date), .groups = "drop")
+
+# Step 2: Create template with correct date ranges and bin_dates
+template <- date_ranges %>%
+  rowwise() %>%
+  mutate(
+    dates = list(seq(first_date, end_date, by = "day"))
+  ) %>%
+  unnest(dates) %>%
+  group_by(uid) %>%
+  mutate(
+    bin_dates = row_number()
+  ) %>%
+  filter(bin_dates <= 90) %>%  # Keep only first 90 days
+  select(uid, date = dates, bin_dates)
+
+# Step 3: Join with app data
+df_app_total_complete <- template %>%
+  left_join(df_app_total, by = c("uid", "date")) %>%
+  mutate(
+    total_duration = if_else(is.na(total_duration), 0, total_duration)  # Replace NA with 0
+  )
+
+# Check if any NA
+print(colSums(is.na(df_app_total_complete)))
+
+# Verification
+verification <- df_app_total_complete %>%
+  group_by(uid) %>%
+  summarise(
+    n_dates = n_distinct(date),
+    min_date = min(date),
+    max_date = max(date),
+    n_bins = n_distinct(bin_dates)
+  )
+
+table(verification$n_dates)
+print(head(verification))
+```
+
+### Combine data of total duration to a df
+```{r}
+
+# df_app_total <- read_csv("./data/df_app_total.csv") 
+
+df_app_total <- df_app_total %>%
+  mutate(total_duration = ifelse(total_duration < 0, 0, total_duration),
+         total_duration = round(total_duration))
+  
+  
+# Merge the three data frames based on `uid` and `date`
+df_combined_total <- data_ema_6 %>%
+  left_join(df_app_total_complete %>% select(-bin_dates), by = c("uid", "date")) %>%
+  left_join(df_calllog_total, by = c("uid", "date")) %>%
+  left_join(df_convo_total, by = c("uid", "date")) %>%
+  select(uid, date, bin_dates, daily_phq_total, total_call_duration, total_app_duration = total_duration, total_convo_duration) %>%
+  mutate(daily_phq_total = round(daily_phq_total),
+    total_app_duration = round(total_app_duration)) # round to integer
+
+# Check NA
+print(colSums(is.na(df_combined_total))) # 27000 rows
+
+# Verification
+verification <- df_combined_total %>%
+  group_by(uid) %>%
+  summarise(
+    n_dates = n_distinct(date),
+    min_date = min(date),
+    max_date = max(date),
+    n_bins = n_distinct(bin_dates)
+  )
+
+table(verification$n_dates)
+print(head(verification))
+
+```
+
+# Calculation
+
+```{r}
+final_ratio <- df_combined_total %>%
+  group_by(uid) %>%
+  summarise(
+    total_convo = sum(total_convo_duration, na.rm = TRUE),
+    total_other = sum(total_call_duration + total_app_duration, na.rm = TRUE),
+    convo_ratio = total_convo / (total_convo + total_other)
+  ) %>%
+  ungroup()
+
+# Add some descriptive statistics
+summary_stats <- final_ratio %>%
+  summarise(
+    mean_ratio = mean(convo_ratio, na.rm = TRUE),
+    median_ratio = median(convo_ratio, na.rm = TRUE),
+    sd_ratio = sd(convo_ratio, na.rm = TRUE),
+    min_ratio = min(convo_ratio, na.rm = TRUE),
+    max_ratio = max(convo_ratio, na.rm = TRUE)
+  )
+
+# Print results
+print("Summary of conversation ratio per participant:")
+print(summary_stats)
+
+# Optional: Look at distribution
+hist_data <- ggplot(final_ratio, aes(x = convo_ratio)) +
+  geom_histogram(binwidth = 0.05) +
+  labs(
+    title = "Distribution of Verbal Conversation Ratio",
+    x = "Ratio of Verbal Conversation Time to Total Communication Time",
+    y = "Count"
+  )
+
+print(hist_data)
+```
+
+```{r}
+
+library(wesanderson)
+
+df_combined_total <- df_combined_total %>%
+  mutate(social_interaction_ratio = total_convo_duration / 
+         (total_convo_duration + total_call_duration + total_app_duration))
+
+# Compute the average ratio & PHQ score per day
+df_avg_ratio <- df_combined_total %>%
+  group_by(bin_dates) %>%
+  summarize(
+    mean_ratio = mean(social_interaction_ratio, na.rm = TRUE),
+    mean_phq = mean(daily_phq_total, na.rm = TRUE)
+  )
+
+# Plot both lines
+ggplot(df_avg_ratio, aes(x = bin_dates)) +
+  geom_line(aes(y = mean_ratio, color = "Social Interaction Ratio"), size = 1) +
+  geom_line(aes(y = mean_phq / max(mean_phq, na.rm = TRUE), color = "Daily PHQ Score"), size = 1) + # , linetype = "dashed"
+  scale_color_manual(values = c("Social Interaction Ratio" = "#E6A8B5", "Daily PHQ Score" = "#8BAF9F")) +
+  labs(title = "Social Interaction Ratio & Depression Score Over 90 Days",
+       x = "Days",
+       y = "Scaled Values (PHQ Score Scaled)",
+       color = "Legend") +
+  theme_minimal()
+
+```
+
+```{r}
+# Plot 1: Box plot by time series to see temporal patterns
+time_series_plot <- df_combined_total %>%
+  mutate(
+    daily_ratio = total_convo_duration / (total_convo_duration + total_call_duration + total_app_duration),
+    week = ceiling(bin_dates/7)  # Group by weeks
+  ) %>%
+  ggplot(aes(x = factor(week), y = daily_ratio)) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  labs(
+    title = "Distribution of Daily Conversation Ratio by Week",
+    x = "Week Number",
+    y = "Ratio of Verbal to Total Communication",
+    caption = "Box plots show median, quartiles, and outliers for each week"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0))
+
+# Plot 2: Stacked area chart to show relative proportions over time
+composition_plot <- df_combined_total %>%
+  group_by(bin_dates) %>%
+  summarise(
+    verbal = mean(total_convo_duration, na.rm = TRUE),
+    calls = mean(total_call_duration, na.rm = TRUE),
+    apps = mean(total_app_duration, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = c(verbal, calls, apps), 
+               names_to = "type", 
+               values_to = "duration") %>%
+  ggplot(aes(x = bin_dates, y = duration, fill = type)) +
+  geom_area(position = "fill") +
+  scale_fill_brewer(palette = "Blues", 
+                    labels = c("App Usage", "Call Duration", "Verbal Conversation")) +
+  labs(
+    title = "Daily Composition of Communication Types",
+    x = "Day Number",
+    y = "Proportion of Total Communication Time",
+    fill = "Communication Type"
+  ) +
+  theme_minimal()
+
+# Display plots
+print(time_series_plot)
+print(composition_plot)
+```
+
+```{r}
+# 1. Individual Trajectory Plot with Mean Trend
+trajectory_plot <- df_combined_total %>%
+  mutate(
+    daily_ratio = total_convo_duration / (total_convo_duration + total_call_duration + total_app_duration)
+  ) %>%
+  ggplot(aes(x = bin_dates)) +
+  # Add individual trajectories with low alpha
+  geom_line(aes(y = daily_ratio, group = uid), alpha = 0.1, color = "gray50") +
+  # Add mean trend line
+  stat_summary(aes(y = daily_ratio), fun = mean, geom = "line", 
+              color = "blue", size = 1.5) +
+  # Add confidence interval
+  stat_summary(aes(y = daily_ratio), fun.data = mean_cl_normal, 
+              geom = "ribbon", alpha = 0.2) +
+  labs(
+    title = "Individual Trajectories with Population Mean",
+    x = "Day Number",
+    y = "Ratio of Verbal to Total Communication",
+    caption = "Gray lines: individual participants; Blue line: population mean"
+  ) +
+  theme_minimal()
+
+# 2. Heatmap of Daily Patterns
+heatmap_plot <- df_combined_total %>%
+  mutate(
+    daily_ratio = total_convo_duration / (total_convo_duration + total_call_duration + total_app_duration),
+    week = ceiling(bin_dates/7),  # Group into weeks
+    weekday = wday(date, label = TRUE)  # Get day of week
+  ) %>%
+  group_by(week, weekday) %>%
+  summarise(
+    mean_ratio = mean(daily_ratio, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  ggplot(aes(x = weekday, y = factor(week), fill = mean_ratio)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Weekly Patterns of Communication Ratio",
+    x = "Day of Week",
+    y = "Week Number",
+    fill = "Mean Ratio"
+  ) +
+  theme_minimal()
+
+# 3. Moving Average Trend with Quantiles
+trend_plot <- df_combined_total %>%
+  mutate(
+    daily_ratio = total_convo_duration / (total_convo_duration + total_call_duration + total_app_duration)
+  ) %>%
+  group_by(bin_dates) %>%
+  summarise(
+    median = median(daily_ratio, na.rm = TRUE),
+    q25 = quantile(daily_ratio, 0.25, na.rm = TRUE),
+    q75 = quantile(daily_ratio, 0.75, na.rm = TRUE)
+  ) %>%
+  ggplot(aes(x = bin_dates)) +
+  geom_line(aes(y = median), color = "blue") +
+  geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.2) +
+  labs(
+    title = "Temporal Trend of Communication Ratio",
+    x = "Day Number",
+    y = "Ratio of Verbal to Total Communication",
+    caption = "Blue line: median; Shaded area: 25th-75th percentile range"
+  ) +
+  theme_minimal()
+
+# Print plots
+print(trajectory_plot)
+print(heatmap_plot)
+print(trend_plot)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+df_combined_total <- df_combined_total %>%
+  mutate(social_interaction_ratio = total_convo_duration / 
+         (total_convo_duration + total_call_duration + total_app_duration))
+
+# Compute the average ratio & PHQ score per day
+df_avg_ratio <- df_combined_total %>%
+  group_by(bin_dates) %>%
+  summarize(
+    mean_ratio = mean(social_interaction_ratio, na.rm = TRUE),
+    mean_phq = mean(daily_phq_total, na.rm = TRUE)
+  )
+
+# Plot both lines
+ggplot(df_avg_ratio, aes(x = bin_dates)) +
+  geom_line(aes(y = mean_ratio, color = "Social Interaction Ratio"), size = 1) +
+  geom_line(aes(y = mean_phq / max(mean_phq, na.rm = TRUE), color = "Daily PHQ Score"), size = 1) + # , linetype = "dashed"
+  scale_color_manual(values = c("Social Interaction Ratio" = "blue", "Daily PHQ Score" = "red")) +
+  labs(title = "Social Interaction Ratio & Depression Score Over 90 Days",
+       x = "Days",
+       y = "Scaled Values (PHQ Score Scaled)",
+       color = "Legend") +
+  theme_minimal()
+
+```
+
+
+# Export All Imputed Datasets for Rubin's Rules Pooling
+
+This section creates m=5 versions of the combined dataset, one per imputation.
+The analysis script will run mlVAR on each and pool results using Rubin's rules.
+
+```{r create-pooled-datasets}
+# ---- Helper functions to process each imputation ----
+
+process_ema_imp <- function(mice_obj, imp_idx) {
+  data_ema_3 <- complete(mice_obj, imp_idx)
+  data_ema_4 <- data_ema_3 %>% filter(bin_dates %in% 1:STUDY_DAYS)
+  data_ema_5 <- data_ema_4 %>%
+    mutate(phq_total = rowSums(select(., paste0("phq_", 1:9)), na.rm = TRUE),
+           phq_mean = rowMeans(select(., paste0("phq_", 1:9)), na.rm = TRUE))
+  data_ema_6 <- data_ema_5 %>%
+    group_by(uid, date) %>%
+    summarize(
+      daily_phq_total = mean(phq_total, na.rm = TRUE),
+      daily_phq_mean = mean(phq_mean, na.rm = TRUE),
+      bin_dates = first(bin_dates),
+      .groups = "drop"
+    )
+  return(data_ema_6)
+}
+
+process_calllog_imp <- function(mice_obj, imp_idx, id_list) {
+  completed <- complete(mice_obj, imp_idx)
+  df_total <- completed %>%
+    group_by(uid, date) %>%
+    summarize(
+      total_call_duration = sum(duration_new, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(uid %in% id_list)
+  return(df_total)
+}
+
+process_convo_imp <- function(mice_obj, imp_idx, id_list) {
+  completed <- complete(mice_obj, imp_idx)
+  df_total <- completed %>%
+    group_by(uid, date) %>%
+    summarize(
+      total_convo_duration = sum(convo_length_sec, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(uid %in% id_list)
+  return(df_total)
+}
+
+process_app_imp <- function(mice_obj, imp_idx, id_list) {
+  completed <- complete(mice_obj, imp_idx)
+  df_app_min <- completed %>%
+    mutate(min_duration = pmin(condition1_duration, condition2_duration,
+                               condition3_duration, na.rm = TRUE))
+  df_total <- df_app_min %>%
+    group_by(uid, date) %>%
+    summarise(total_duration = sum(min_duration, na.rm = TRUE), .groups = "drop") %>%
+    filter(uid %in% id_list)
+  return(df_total)
+}
+
+# ---- Generate all m combined datasets ----
+
+# Date ranges and template (same across imputations since dates are not imputed)
+date_ranges_pool <- data_ema_6 %>%
+  group_by(uid) %>%
+  summarise(first_date = min(date), end_date = max(date), .groups = "drop")
+
+template_pool <- date_ranges_pool %>%
+  rowwise() %>%
+  mutate(dates = list(seq(first_date, end_date, by = "day"))) %>%
+  unnest(dates) %>%
+  group_by(uid) %>%
+  mutate(bin_dates = row_number()) %>%
+  filter(bin_dates <= STUDY_DAYS) %>%
+  select(uid, date = dates, bin_dates) %>%
+  ungroup()
+
+df_combined_all <- map_dfr(1:IMPUTATION_M, function(i) {
+  cat("Processing imputation", i, "of", IMPUTATION_M, "\n")
+
+  ema_i <- process_ema_imp(mice_ema, i)
+  calllog_i <- process_calllog_imp(mice_calllog, i, IDlist)
+  convo_i <- process_convo_imp(mice_convo, i, IDlist)
+  app_i <- process_app_imp(mice_app, i, IDlist)
+
+  # Complete app data with template (fill missing dates with 0)
+  app_complete_i <- template_pool %>%
+    left_join(app_i, by = c("uid", "date")) %>%
+    mutate(total_duration = if_else(is.na(total_duration), 0, total_duration))
+
+  # Clean app durations
+  app_complete_i <- app_complete_i %>%
+    mutate(total_duration = ifelse(total_duration < 0, 0, total_duration),
+           total_duration = round(total_duration))
+
+  # Combine all data sources (drop bin_dates from app to avoid suffix conflict)
+  combined_i <- ema_i %>%
+    left_join(app_complete_i %>% select(-bin_dates), by = c("uid", "date")) %>%
+    left_join(calllog_i, by = c("uid", "date")) %>%
+    left_join(convo_i, by = c("uid", "date")) %>%
+    select(uid, date, bin_dates,
+           daily_phq_total, daily_phq_mean,
+           total_call_duration,
+           total_app_duration = total_duration,
+           total_convo_duration) %>%
+    mutate(daily_phq_total = round(daily_phq_total),
+           total_app_duration = round(total_app_duration),
+           .imp = i)
+
+  return(combined_i)
+})
+
+cat("Total rows:", nrow(df_combined_all), "\n")
+cat("Expected:", 300 * STUDY_DAYS * IMPUTATION_M, "\n")
+cat("Imputations:", unique(df_combined_all$.imp), "\n")
+```
+
+```{r export-pooled-data}
+# Export stacked dataset for Rubin's rules analysis
+write_csv(df_combined_all, here::here("data", "df_combined_total_pooled.csv"))
+cat("Exported pooled dataset with", IMPUTATION_M, "imputations to data/df_combined_total_pooled.csv\n")
+
+# Also keep the single-imputation export for backwards compatibility
+write_csv(
+  df_combined_all %>% filter(.imp == 1) %>% select(-.imp),
+  here::here("data", "df_combined_total.csv")
+)
+cat("Exported single-imputation dataset to data/df_combined_total.csv\n")
+```
